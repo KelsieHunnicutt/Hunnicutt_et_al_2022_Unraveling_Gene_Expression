@@ -1,0 +1,2897 @@
+---
+title: "The effects of cell composition on differential expression inference"
+author: "Kelsie E. Hunnicutt"
+date: '2022-05-04'
+output: html_document
+---
+
+<h1>Data processing</h1>
+<h3>Loading libraries and importing data</h3>
+```{r warning=FALSE, include=FALSE}
+
+#BiocManager::install("edgeR")
+#BiocManager::install("limma")
+
+suppressMessages(library("edgeR")) #for DE analysis
+suppressMessages(library("limma")) #additional DE support
+suppressMessages(library("vegan")) #additional DE support; RPKM normalization
+suppressMessages(library("reshape2")) #for dataframe manipulation
+suppressMessages(library("data.table")) #also for datafrome manipulation
+suppressMessages(library("tidyverse")) #also dataframe manipulation
+suppressMessages(library("RColorBrewer")) #color palette generator
+suppressMessages(library("ComplexHeatmap")) #for visualizing heatmaps
+suppressMessages(library("matrixStats"))  # for row medians
+suppressMessages(library("knitr")) #for kables
+suppressMessages(library("ggplot2")) #for graph visualization
+suppressMessages(library("beanplot"))  # visualize FPKM values
+suppressMessages(library("calibrate"))  # textxy for plotting
+suppressMessages(library("multcomp")) #for stats analysis
+suppressMessages(library("multcompView")) #for stats analysis
+
+options(scipen=999) #prevent scientific notation when printing
+
+#set working directory
+setwd("~/Dropbox/1_Denver/Research/Single_Cell_Paper/R_Analysis")
+
+#select a counts file then read in raw counts
+count_file.path <- "SingleCell_no-multi_20Jun20_suspenders_featureCounts.csv"
+#count_file.path <- "SingleCell_all_20Jun20_suspenders_featureCounts.csv"
+
+count_data <- read.table(count_file.path, header = TRUE, row.names=NULL, sep = "\t")
+
+#select a metadata file then read in info
+metadata_file.path <- "SingleCell_no-multi_20Jun20_suspenders_featureCounts.csv.summary"
+#metadata_file.path <- "SingleCell_all_20Jun20_suspenders_featureCounts.csv.summary"
+metadata <- read.table(metadata_file.path, header = TRUE, row.names=1, sep = "\t")
+
+#load annotation file for either all genes or just protein coding
+#this file was manipulated with sed from the ensembl gtf file 
+annotations <- read.table("ensembl_allgenes_mm38_96_chrs.txt", header = TRUE, stringsAsFactors = FALSE, row.names = c(1))
+#annotations <- read.table("ensembl_proteincoding_mm38_96_chrs.txt", header = TRUE, stringsAsFactors = FALSE, row.names = c(1))
+annotations <- annotations[order(rownames(annotations)), ]
+setorder(annotations, chr, start)
+head(annotations)
+
+#parsing out gene lengths to add to the annotation file
+genes_list <- count_data[1:6]
+genes_list <- genes_list[genes_list$Geneid %in% rownames(annotations),]
+rownames(genes_list) <- genes_list$Geneid
+genes_list <- genes_list[rownames(annotations), ]
+annotations <- cbind("Length" = genes_list$Length, annotations)
+```
+
+<h3>Reformatting condition names</h3>
+```{r, include=FALSE}
+#edit metadata to include condition type (condition_name) for each sample
+#transpose, rename columns, delete redundant row
+metadata <- t(metadata)
+head(rownames(metadata))
+rownames(metadata) <- gsub(".WT.*.bam","-WT", rownames(metadata))
+rownames(metadata) <- gsub(".SP.*.bam","-SP", rownames(metadata))
+rownames(metadata) <- gsub(".LZ.*.bam","-LZ", rownames(metadata))
+rownames(metadata) <- gsub(".DIP.*.bam","-DIP", rownames(metadata))
+rownames(metadata) <- gsub(".RS.*.bam","-RS", rownames(metadata))
+rownames(metadata)  <- gsub("..*WWLL\\.","DomP-", rownames(metadata))
+rownames(metadata)  <- gsub("..*LLWW\\.","DomP-", rownames(metadata))
+rownames(metadata)  <- gsub("..*PPCC\\.","MusP-", rownames(metadata))
+rownames(metadata)  <- gsub("..*CCPP\\.","MusP-", rownames(metadata))
+rownames(metadata)  <- gsub("..*LLPP\\.","DFHyb-", rownames(metadata))
+rownames(metadata)  <- gsub("..*PPLL\\.","MSHyb-", rownames(metadata))
+
+head(rownames(metadata))
+
+#split status into meaningful info
+conditions_df <- colsplit(row.names(metadata), pattern = "-", names = c("cross","male_number","stage"))
+conditions_df$sample_name <- paste(conditions_df$cross, conditions_df$male_number, conditions_df$stage, sep = ".")
+
+#group names
+conditions_df$condition_name <- paste(conditions_df$cross, conditions_df$stage, sep = "-") 
+
+#combined original metadata with conditions matrix
+metadata <- cbind(metadata, conditions_df)
+
+#in preparation for DGE creation, make a dataframe of just gene name and counts
+
+count_matrix <- count_data[7:dim(count_data)[2]]
+row.names(count_matrix) <- count_data[,1]
+count_matrix <- count_matrix[rownames(annotations), ]
+head(colnames(count_matrix))
+
+#fix my sample names
+colnames(count_matrix) <- gsub(".WT.*.bam","-WT", colnames(count_matrix))
+colnames(count_matrix) <- gsub(".SP.*.bam","-SP", colnames(count_matrix))
+colnames(count_matrix) <- gsub(".LZ.*.bam","-LZ", colnames(count_matrix))
+colnames(count_matrix) <- gsub(".DIP.*.bam","-DIP", colnames(count_matrix))
+colnames(count_matrix) <- gsub(".RS.*.bam","-RS", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*WWLL\\.","DomP-", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*LLWW\\.","DomP-", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*PPCC\\.","MusP-", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*CCPP\\.","MusP-", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*LLPP\\.","DFHyb-", colnames(count_matrix))
+colnames(count_matrix)  <- gsub("..*PPLL\\.","MSHyb-", colnames(count_matrix))
+
+head(colnames(count_matrix))
+```
+
+<h3>Settings</h3>
+```{r}
+#expression thresholds; require a minimum rpkm of 1 in at least three samples
+rpkm.cutoff <- 1
+min.reps <- 3
+normalization.method <- "RLE"
+#export figures to files?
+export.figures <- FALSE
+
+#printing for record keeping purposes
+paste("countfile used:", count_file.path, sep = " ")
+paste("metadata file used:", metadata_file.path, sep = " ")
+
+#printing for record keeping purposes
+print("Parameters Used:")
+paste("All genes have a minimum rpkm of:", rpkm.cutoff, sep = " ")
+paste("A gene must be expressed in at least", min.reps, "samples", sep = " ")
+paste("Counts are normalized with:", normalization.method, sep = " ")
+
+#make DGEs for sorted cell data (Dev), whole testes data (WT), and the combined dataset (Full)
+dgeFull <- DGEList(count_matrix, genes=annotations, group=metadata$condition_name)
+dgeDev <- DGEList(count_matrix[,grep("WT",colnames(count_matrix), invert = TRUE)], genes=annotations, group=grep("WT",metadata$condition_name, value = TRUE, invert = TRUE))
+dgeWT <- DGEList(count_matrix[,grep("WT",colnames(count_matrix))], genes=annotations, group=grep("WT",metadata$condition_name, value = TRUE))
+
+#print expressed genes for each DGE - pre-filter
+paste("Expressed genes in Full dataset (no cutoffs):", nrow(dgeFull), sep = " ")
+paste("Expressed genes in sorted cell dataset (no cutoffs):", nrow(dgeDev), sep = " ")
+paste("Expressed genes in whole testes dataset (no cutoffs):", nrow(dgeWT), sep = " ")
+
+#require gene to be expressed (~6 copies) in at least 2 samples
+keep_Full <- rowSums(rpkm(dgeFull) >= rpkm.cutoff) >= min.reps
+keep_Dev <- rowSums(rpkm(dgeDev) >= rpkm.cutoff) >= min.reps
+keep_WT <- rowSums(rpkm(dgeWT) >= rpkm.cutoff) >= min.reps
+
+#reset DGEs with genes meeting minimum requirements
+dgeFull <- dgeFull[keep_Full, keep.lib.sizes=FALSE]
+dgeFull <- calcNormFactors(dgeFull, method= normalization.method)
+dgeDev <- dgeDev[keep_Dev, keep.lib.sizes=FALSE]
+dgeDev <- calcNormFactors(dgeDev, method= normalization.method)
+dgeWT <- dgeWT[keep_WT, keep.lib.sizes=FALSE]
+dgeWT <- calcNormFactors(dgeWT, method= normalization.method)
+
+#cleanup
+rm(keep_Full, keep_Dev, keep_WT)
+
+#print expressed genes for each DGE- post filter
+paste("Expressed genes in full dataset (with filtering):", nrow(dgeFull), sep = " ")
+paste("Expressed genes in sorted cell dataset (with filtering):", nrow(dgeDev), sep = " ")
+paste("Expressed genes in whole testes dataset (with filtering):", nrow(dgeWT), sep = " ")
+```
+
+<h3>Catogorize expressed genes by chromosome</h3>
+```{r}
+#subset count data into counts for genes on all autosomes
+just_auto_counts <- count_matrix[grep("X|Y",annotations$chr, invert = TRUE),]
+auto_genes <- annotations[rownames(annotations[grep("X|Y",annotations$chr, invert = TRUE),]),]
+
+#subset count data into counts for genes on the X chromosome
+just_X_counts <- count_matrix[grep("X",annotations$chr),]
+X_genes <- annotations[rownames(annotations[grep("^X",annotations$chr),]),]
+
+#subset count data into counts for genes on the Y chromosome
+just_Y_counts <- count_matrix[grep("Y",annotations$chr),]
+Y_genes <- annotations[rownames(annotations[grep("^Y",annotations$chr),]),]
+
+#needed for hybrid vs parent BCV tests
+count_matrix_dev <- count_matrix[grep("WT",colnames(count_matrix), invert = TRUE)]
+dev_group_names <- grep("WT",metadata$condition_name, value = TRUE, invert = TRUE)
+
+#summary line
+paste("total_genes:", length(rownames(annotations)), "auto_genes:", length(rownames(auto_genes)), "X_genes:", length(rownames(X_genes)), "Y_genes:", length(rownames(Y_genes)), sep = " ")
+
+#number of expressed genes in whole testes data
+mack_numbers <- paste("total_genes:", length(dgeWT$genes$gene), "; auto_genes:", sum(auto_genes$gene  %in% dgeWT$genes$gene), "; X_genes:", sum(X_genes$gene  %in% dgeWT$genes$gene), "Y_genes:", sum(Y_genes$gene  %in% dgeWT$genes$gene), "; x/a=", round(sum(X_genes$gene  %in% dgeWT$genes$gene)/length(dgeWT$genes$gene)*100,2), "%; y/a=", round(sum(Y_genes$gene  %in% dgeWT$genes$gene)/length(dgeWT$genes$gene)*100,2), "%; x/y=", round(sum(X_genes$gene  %in% dgeWT$genes$gene)/(sum(Y_genes$gene  %in% dgeWT$genes$gene)),2), "%",  sep = " ")
+
+#number of expressed genes in sorted cell data
+larson_numbers <- paste("total_genes:", length(dgeDev$genes$gene), "; auto_genes:", sum(auto_genes$gene  %in% dgeDev$genes$gene), "; X_genes:", sum(X_genes$gene  %in% dgeDev$genes$gene), "Y_genes:", sum(Y_genes$gene  %in% dgeDev$genes$gene), "; x/a=", round(sum(X_genes$gene  %in% dgeDev$genes$gene)/length(dgeDev$genes$gene)*100,2), "%; y/a=", round(sum(Y_genes$gene  %in% dgeDev$genes$gene)/length(dgeDev$genes$gene)*100,2), "%; x/y=", round(sum(X_genes$gene  %in% dgeDev$genes$gene)/(sum(Y_genes$gene  %in% dgeDev$genes$gene)),2), "%",  sep = " ")
+
+#number of expressed genes in combined data
+combined_numbers <- paste("total_genes:", length(dgeFull$genes$gene), "; auto_genes:", sum(auto_genes$gene  %in% dgeFull$genes$gene), "; X_genes:", sum(X_genes$gene  %in% dgeFull$genes$gene), "Y_genes:", sum(Y_genes$gene  %in% dgeFull$genes$gene), "; x/a=", round(sum(X_genes$gene  %in% dgeFull$genes$gene)/length(dgeFull$genes$gene)*100,2), "%; y/a=", round(sum(Y_genes$gene  %in% dgeFull$genes$gene)/length(dgeFull$genes$gene)*100,2), "%; x/y=", round(sum(X_genes$gene  %in% dgeFull$genes$gene)/(sum(Y_genes$gene  %in% dgeFull$genes$gene)),2), "%",  sep = " ")
+
+paste("Number of genes expressed (WT only):", mack_numbers)
+paste("Number of genes expressed  (Dev only):", larson_numbers)
+paste("Number of genes expressed  (Combined):", combined_numbers)
+```
+
+<h3>Make all subsetted DGEs for MDSplots using all genes</h3>
+```{r}
+#make all subsetted DGEs for MDSplots; all genes
+#subsetted by stage; WT already made in above chunk; based on Full dataset
+dgeSP <- DGEList(count_matrix[,grep("SP",colnames(count_matrix))], genes=annotations, group=grep("SP",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeSP) >= rpkm.cutoff) >= min.reps
+dgeSP <- dgeSP[keep, keep.lib.sizes=FALSE]
+dgeSP <- calcNormFactors(dgeSP, method = normalization.method)
+
+dgeLZ <- DGEList(count_matrix[,grep("LZ",colnames(count_matrix))], genes=annotations, group=grep("LZ",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeLZ) >= rpkm.cutoff) >= min.reps
+dgeLZ <- dgeLZ[keep, keep.lib.sizes=FALSE]
+dgeLZ <- calcNormFactors(dgeLZ, method = normalization.method)
+
+dgeDIP <- DGEList(count_matrix[,grep("DIP",colnames(count_matrix))], genes=annotations, group=grep("DIP",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeDIP) >= rpkm.cutoff) >= min.reps
+dgeDIP <- dgeDIP[keep, keep.lib.sizes=FALSE]
+dgeDIP <- calcNormFactors(dgeDIP, method = normalization.method)
+
+dgeRS <- DGEList(count_matrix[,grep("RS",colnames(count_matrix))], genes=annotations, group=grep("RS",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeRS) >= rpkm.cutoff) >= min.reps
+dgeRS <- dgeRS[keep, keep.lib.sizes=FALSE]
+dgeRS <- calcNormFactors(dgeRS, method = normalization.method)
+
+#subsetted by genotype; based on Full dataset
+dgeMusP <- DGEList(count_matrix[,grep("MusP",colnames(count_matrix))], genes=annotations, group=grep("MusP",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeMusP) >= rpkm.cutoff) >= min.reps
+dgeMusP <- dgeMusP[keep, keep.lib.sizes=FALSE]
+dgeMusP <- calcNormFactors(dgeMusP, method = normalization.method)
+
+dgeDomP <- DGEList(count_matrix[,grep("DomP",colnames(count_matrix))], genes=annotations, group=grep("DomP",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeDomP) >= rpkm.cutoff) >= min.reps
+dgeDomP <- dgeDomP[keep, keep.lib.sizes=FALSE]
+dgeDomP <- calcNormFactors(dgeDomP, method = normalization.method)
+
+dgeMSHyb <- DGEList(count_matrix[,grep("MSHyb",colnames(count_matrix))], genes=annotations, group=grep("MSHyb",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeMSHyb) >= rpkm.cutoff) >= min.reps
+dgeMSHyb <- dgeMSHyb[keep, keep.lib.sizes=FALSE]
+dgeMSHyb <- calcNormFactors(dgeMSHyb, method = normalization.method)
+
+dgeDFHyb <- DGEList(count_matrix[,grep("DFHyb",colnames(count_matrix))], genes=annotations, group=grep("DFHyb",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeDFHyb) >= rpkm.cutoff) >= min.reps
+dgeDFHyb <- dgeDFHyb[keep, keep.lib.sizes=FALSE]
+dgeDFHyb <- calcNormFactors(dgeDFHyb, method = normalization.method)
+
+#subsetted by stage but now just based on sorted cell dataset
+dgeMusPDev <- DGEList(count_matrix[,grep("MusP-.*-[D,S,L,R]",colnames(count_matrix))], genes=annotations, group=grep("MusP-[D,S,L,R]",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeMusPDev) >= rpkm.cutoff) >= min.reps
+dgeMusPDev <- dgeMusPDev[keep, keep.lib.sizes=FALSE]
+dgeMusPDev <- calcNormFactors(dgeMusPDev, method = normalization.method)
+
+dgeDomPDev <- DGEList(count_matrix[,grep("DomP-.*-[D,S,L,R]",colnames(count_matrix))], genes=annotations, group=grep("DomP-[D,S,L,R]",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeDomPDev) >= rpkm.cutoff) >= min.reps
+dgeDomPDev <- dgeDomPDev[keep, keep.lib.sizes=FALSE]
+dgeDomPDev <- calcNormFactors(dgeDomPDev, method = normalization.method)
+
+dgeMSHybDev <- DGEList(count_matrix[,grep("MSHyb-.*-[D,S,L,R]",colnames(count_matrix))], genes=annotations, group=grep("MSHyb-[D,S,L,R]",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeMSHybDev) >= rpkm.cutoff) >= min.reps
+dgeMSHybDev <- dgeMSHybDev[keep, keep.lib.sizes=FALSE]
+dgeMSHybDev <- calcNormFactors(dgeMSHybDev, method = normalization.method)
+
+dgeDFHybDev <- DGEList(count_matrix[,grep("DFHyb-.*-[D,S,L,R]",colnames(count_matrix))], genes=annotations, group=grep("DFHyb-[D,S,L,R]",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeDFHybDev) >= rpkm.cutoff) >= min.reps
+dgeDFHybDev <- dgeDFHybDev[keep, keep.lib.sizes=FALSE]
+dgeDFHybDev <- calcNormFactors(dgeDFHybDev, method = normalization.method)
+
+#DGEs for parents and hybrids from just sorted cell data and just whole testes data; used to show WT hybrids have higher BCV
+dgeDev_Hyb <- DGEList(count_matrix_dev[,grep("Hyb",colnames(count_matrix_dev))], genes=annotations, group=grep("Hyb",dev_group_names, value = TRUE))
+keep <- rowSums(rpkm(dgeDev_Hyb) >= rpkm.cutoff) >= min.reps
+dgeDev_Hyb <- dgeDev_Hyb[keep, keep.lib.sizes=FALSE]
+dgeDev_Hyb <- calcNormFactors(dgeDev_Hyb, method = normalization.method)
+
+dgeDev_Par <- DGEList(count_matrix_dev[,grep("P-",colnames(count_matrix_dev))], genes=annotations, group=grep("P-",dev_group_names, value = TRUE))
+keep <- rowSums(rpkm(dgeDev_Par) >= rpkm.cutoff) >= min.reps
+dgeDev_Par <- dgeDev_Par[keep, keep.lib.sizes=FALSE]
+dgeDev_Par <- calcNormFactors(dgeDev_Par, method = normalization.method)
+
+dgeWT_Hyb <- DGEList(count_matrix[,grep("Hyb.*WT",colnames(count_matrix))], genes=annotations, group=grep("Hyb.*WT",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeWT_Hyb) >= rpkm.cutoff) >= min.reps
+dgeWT_Hyb <- dgeWT_Hyb[keep, keep.lib.sizes=FALSE]
+dgeWT_Hyb <- calcNormFactors(dgeWT_Hyb, method = normalization.method)
+
+dgeWT_Par <- DGEList(count_matrix[,grep("P.*WT",colnames(count_matrix))], genes=annotations, group=grep("P.*WT",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeWT_Par) >= rpkm.cutoff) >= min.reps
+dgeWT_Par <- dgeWT_Par[keep, keep.lib.sizes=FALSE]
+dgeWT_Par <- calcNormFactors(dgeWT_Par, method = normalization.method)
+
+#sex chromosome DGEs
+dgeX_Full <- DGEList(just_X_counts, genes=X_genes, group=metadata$condition_name)
+keep <- rowSums(rpkm(dgeX_Full) >= rpkm.cutoff) >= min.reps
+dgeX_Full <- dgeX_Full[keep, keep.lib.sizes=FALSE]
+dgeX_Full <- calcNormFactors(dgeX_Full, method = normalization.method)
+
+dgeY_Full <- DGEList(just_Y_counts, genes=Y_genes, group=metadata$condition_name)
+keep <- rowSums(rpkm(dgeY_Full) >= rpkm.cutoff) >= min.reps
+dgeY_Full <- dgeY_Full[keep, keep.lib.sizes=FALSE]
+dgeY_Full <- calcNormFactors(dgeY_Full, method = normalization.method)
+
+dgeY_RS <- DGEList(just_Y_counts[,grep("RS",colnames(count_matrix))], genes=Y_genes, group=grep("RS",metadata$condition_name, value = TRUE))
+keep <- rowSums(rpkm(dgeY_RS) >= rpkm.cutoff) >= min.reps
+dgeY_RS <- dgeY_RS[keep, keep.lib.sizes=FALSE]
+dgeY_RS <- calcNormFactors(dgeY_RS, method = normalization.method)
+
+#cleanup
+rm(keep)
+```
+
+<h3>Define the base order of the heatmap columns</h3>
+```{r}
+metadata$cross <- factor(metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+sort1 <- seq(1,4)[metadata$cross]
+metadata$stage <- factor(metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+sort2 <- seq(1,5)[metadata$stage]
+heatmap_order <- rownames(metadata[with(metadata, order(sort2, sort1)),])
+
+Dev_heatmap_order <- grep("WT", heatmap_order, value = TRUE, invert = TRUE)
+MusP_heatmap_order <- grep("MusP", heatmap_order, value = TRUE)
+DomP_heatmap_order <- grep("DomP", heatmap_order, value = TRUE)
+MSHyb_heatmap_order <- grep("MSHyb", heatmap_order, value = TRUE)
+DFHyb_heatmap_order <- grep("DFHyb", heatmap_order, value = TRUE)
+ALL_Hyb_heatmap_order <- grep("Hyb", heatmap_order, value = TRUE)
+
+MusP_Dev_heatmap_order <- grep("WT", MusP_heatmap_order, value = TRUE, invert = TRUE)
+DomP_Dev_heatmap_order <- grep("WT", DomP_heatmap_order, value = TRUE, invert = TRUE)
+MSHyb_Dev_heatmap_order <- grep("WT", MSHyb_heatmap_order, value = TRUE, invert = TRUE)
+DFHyb_Dev_heatmap_order <- grep("WT", DFHyb_heatmap_order, value = TRUE, invert = TRUE)
+ALL_Hyb_Dev_heatmap_order <- grep("WT", ALL_Hyb_heatmap_order, value = TRUE, invert = TRUE)
+
+SP_heatmap_order <- grep("SP", heatmap_order, value = TRUE)
+LZ_heatmap_order <- grep("LZ", heatmap_order, value = TRUE)
+DIP_heatmap_order <- grep("DIP", heatmap_order, value = TRUE)
+RS_heatmap_order <- grep("RS", heatmap_order, value = TRUE)
+WT_heatmap_order <- grep("WT", heatmap_order, value = TRUE)
+
+stages <- c("SP", "LZ", "DIP", "RS", "WT")
+genotypes <- c("MusP", "DomP", "MSHyb", "DFHyb")
+datasets <- c("Full", "Dev", "WT")
+
+#define color palette for all heatmaps
+colfunc <- colorRampPalette(c("#FFFFFF", "#2F2323"))
+browns <- colfunc(255)
+```
+
+<h3>Set up CPM, RPKM, and Normalized RPKM data frames - not subsetted</h3>
+```{r}
+cpm_Full <- cpm(dgeFull, log = TRUE)
+cpm_Dev  <- cpm(dgeDev,  log = TRUE)
+cpm_WT   <- cpm(dgeWT,   log = TRUE)
+cpm_justX <- subset(cpm_Full, rownames(cpm_Full) %in% rownames(X_genes))
+cpm_justY <- subset(cpm_Full, rownames(cpm_Full) %in% rownames(Y_genes))
+
+rpkm_Full <- as.data.frame(rpkm(dgeFull, normalized.lib.sizes = TRUE, log = FALSE))
+rpkm_Dev  <- as.data.frame(rpkm(dgeDev,  normalized.lib.sizes = TRUE, log = FALSE))
+rpkm_WT   <- as.data.frame(rpkm(dgeWT,   normalized.lib.sizes = TRUE, log = FALSE))
+rpkm_justX <- subset(rpkm_Full, rownames(rpkm_Full) %in% rownames(X_genes))
+rpkm_justY <- subset(rpkm_Full, rownames(rpkm_Full) %in% rownames(Y_genes))
+
+rpkm_Full.log <- as.data.frame(rpkm(dgeFull, normalized.lib.sizes = TRUE, log = TRUE))
+rpkm_Dev.log  <- as.data.frame(rpkm(dgeDev,  normalized.lib.sizes = TRUE, log = TRUE))
+rpkm_WT.log   <- as.data.frame(rpkm(dgeWT,   normalized.lib.sizes = TRUE, log = TRUE))
+rpkm_justX.log <- subset(rpkm_Full, rownames(rpkm_Full) %in% rownames(X_genes))
+rpkm_justY.log <- subset(rpkm_Full, rownames(rpkm_Full) %in% rownames(Y_genes))
+
+rpkm_Full.norm <- decostand(as.data.frame(rpkm(dgeFull, normalized.lib.sizes = TRUE)), "normalize")
+rpkm_Dev.norm  <- decostand(as.data.frame(rpkm(dgeDev,  normalized.lib.sizes = TRUE)), "normalize")
+rpkm_WT.norm   <- decostand(as.data.frame(rpkm(dgeWT,   normalized.lib.sizes = TRUE)), "normalize")
+rpkm_justX.norm <- subset(rpkm_Full.norm, rownames(rpkm_Full.norm) %in% rownames(X_genes))
+rpkm_justY.norm <- subset(rpkm_Full.norm, rownames(rpkm_Full.norm) %in% rownames(Y_genes))
+```
+
+<h3>Set up CPM, RPKM, and Normalized RPKM data frames - subsetted by stage</h3>
+```{r}
+#make cpm, rpkm, and rpkm.norm dataframes for each stage across genotypes using Full dataset
+for (f in 1:(length(stages))){
+  cpm <- cpm_Full[,grep(stages[f], colnames(just_auto_counts))]
+  rpkm <- rpkm_Full[,grep(stages[f], colnames(count_matrix))]
+  rpkm.norm <- rpkm_Full.norm[,grep(stages[f], colnames(count_matrix))]
+  assign(paste("cpm", "Full", stages[f], sep = "_"), cpm)
+  assign(paste("rpkm", "Full", stages[f], sep = "_"), rpkm)
+  assign(paste(paste("rpkm", "Full", stages[f], sep = "_"),"norm", sep = "."), rpkm.norm)
+}
+
+rm(cpm, rpkm, rpkm.norm)
+
+#make cpm, rpkm, and rpkm.norm dataframes for each stage across genotypes using just sorted cell dataset
+for (f in 1:(length(stages)-1)){
+  cpm <- cpm_Dev[,grep(stages[f], colnames(cpm_Dev))]
+  rpkm <- rpkm_Dev[,grep(stages[f], colnames(rpkm_Dev))]
+  rpkm.norm <- rpkm_Dev.norm[,grep(stages[f], colnames(rpkm_Dev.norm))]
+  assign(paste("cpm", "Dev", stages[f], sep = "_"), cpm)
+  assign(paste("rpkm", "Dev", stages[f], sep = "_"), rpkm)
+  assign(paste(paste("rpkm", "Dev", stages[f], sep = "_"),"norm", sep = "."), rpkm.norm)
+}
+
+rm(cpm, rpkm, rpkm.norm)
+```
+
+<h3>Set up CPM, RPKM, and Normalized RPKM data frames - subsetted by genotype and stage but not by chromosome</h3>
+```{r}
+#make cpm, rpkm, and rpkm.norm dataframes for each stage type for each genotype across all genes
+for (q in 1:length(stages)){
+  for (r in 1:length(genotypes)) {
+  #subsets for each genotype across stages
+  cpmALL <- cpm_Full[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL <- rpkm_Full[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL.norm <- rpkm_Full.norm[,grep(genotypes[r], colnames(count_matrix))]
+  
+  #print genotype plus stage combination
+  combo_name <- paste(genotypes[r], stages[q], sep = ".*")
+
+  #subsets for each genotype for each stage
+  cpm <- cpm_Full[,grep(combo_name, colnames(just_auto_counts))]
+  rpkm <- rpkm_Full[,grep(combo_name, colnames(count_matrix))]
+  rpkm.norm <- rpkm_Full.norm[,grep(combo_name, colnames(count_matrix))]
+
+  #assign to relevant variable name
+  assign(paste("cpm", "Full", genotypes[r], sep = "_"), cpmALL)
+  assign(paste("rpkm", "Full", genotypes[r], sep = "_"), rpkmALL)
+  assign(paste(paste("rpkm", "Full", genotypes[r], sep = "_"),"norm", sep = "."), rpkmALL.norm)
+  
+  assign(paste("cpm", "Full", genotypes[r], stages[q], sep = "_"), cpm)
+  assign(paste("rpkm", "Full", genotypes[r], stages[q], sep = "_"), rpkm)
+  assign(paste(paste("rpkm", "Full", genotypes[r], stages[q], sep = "_"),"norm", sep = "."), rpkm.norm)
+  }
+}
+
+rm(cpmALL, rpkmALL, rpkmALL.norm)
+rm(cpm, rpkm, rpkm.norm)
+```
+
+<h3>Set up CPM, RPKM, and Normalized RPKM data frames - X and Y subsets</h3>
+```{r}
+#make cpm, rpkm, and rpkm.norm dataframes for each stage type for each genotype across all X chromosome genes
+for (q in 1:length(stages)){
+  for (r in 1:length(genotypes)) {
+  #subsets for each genotype across stages
+  cpmALL <- cpm_justX[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL <- rpkm_justX[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL.norm <- rpkm_justX.norm[,grep(genotypes[r], colnames(count_matrix))]
+  
+  #print genotype plus stage combination
+  combo_name <- paste(genotypes[r], stages[q], sep = ".*")
+
+  #subsets for each genotype for each stage
+  cpm <- cpm_justX[,grep(combo_name, colnames(just_auto_counts))]
+  rpkm <- rpkm_justX[,grep(combo_name, colnames(count_matrix))]
+  rpkm.norm <- rpkm_justX.norm[,grep(combo_name, colnames(count_matrix))]
+
+  #assign to relevant variable name
+  assign(paste("cpm", genotypes[r], "justX", sep = "_"), cpmALL)
+  assign(paste("rpkm", genotypes[r], "justX", sep = "_"), rpkmALL)
+  assign(paste(paste("rpkm", genotypes[r], "justX", sep = "_"),"norm", sep = "."), rpkmALL.norm)
+  
+  assign(paste("cpm", genotypes[r], stages[q], "justX", sep = "_"), cpm)
+  assign(paste("rpkm", genotypes[r], stages[q], "justX", sep = "_"), rpkm)
+  assign(paste(paste("rpkm", genotypes[r], stages[q], "justX", sep = "_"),"norm", sep = "."), rpkm.norm)
+  }
+}
+
+rm(cpmALL, rpkmALL, rpkmALL.norm)
+rm(cpm, rpkm, rpkm.norm)
+
+#make cpm, rpkm, and rpkm.norm dataframes for each stage type for each genotype across all Y chromosome genes
+for (q in 1:length(stages)){
+  for (r in 1:length(genotypes)) {
+  #subsets for each genotype across stages
+  cpmALL <- cpm_justY[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL <- rpkm_justY[,grep(genotypes[r], colnames(count_matrix))]
+  rpkmALL.norm <- rpkm_justY.norm[,grep(genotypes[r], colnames(count_matrix))]
+  
+  #print genotype plus stage combination
+  combo_name <- paste(genotypes[r], stages[q], sep = ".*")
+
+  #subsets for each genotype for each stage
+  cpm <- cpm_justY[,grep(combo_name, colnames(just_auto_counts))]
+  rpkm <- rpkm_justY[,grep(combo_name, colnames(count_matrix))]
+  rpkm.norm <- rpkm_justY.norm[,grep(combo_name, colnames(count_matrix))]
+
+  #assign to relevant variable name
+  assign(paste("cpm", genotypes[r], "justY", sep = "_"), cpmALL)
+  assign(paste("rpkm", genotypes[r], "justY", sep = "_"), rpkmALL)
+  assign(paste(paste("rpkm", genotypes[r], "justY", sep = "_"),"norm", sep = "."), rpkmALL.norm)
+  
+  assign(paste("cpm", genotypes[r], stages[q], "justY", sep = "_"), cpm)
+  assign(paste("rpkm", genotypes[r], stages[q], "justY", sep = "_"), rpkm)
+  assign(paste(paste("rpkm", genotypes[r], stages[q], "justY", sep = "_"),"norm", sep = "."), rpkm.norm)
+  }
+}
+
+rm(cpmALL, rpkmALL, rpkmALL.norm)
+rm(cpm, rpkm, rpkm.norm)
+```
+
+<h3>Create sex chromosomes subsets by genotype using just sorted cell dataset</h3>
+```{r}
+#make sex chromosome subsets based just on sorted cell data
+cpm_Dev_justX <- subset(cpm_Dev, rownames(cpm_Dev) %in% rownames(X_genes))
+cpm_Dev_justY <- subset(cpm_Dev, rownames(cpm_Dev) %in% rownames(Y_genes))
+rpkm_Dev_justX <- subset(rpkm_Dev, rownames(rpkm_Dev) %in% rownames(X_genes))
+rpkm_Dev_justY <- subset(rpkm_Dev, rownames(rpkm_Dev) %in% rownames(Y_genes))
+rpkm_Dev_justX.norm <- subset(rpkm_Dev.norm, rownames(rpkm_Dev.norm) %in% rownames(X_genes))
+rpkm_Dev_justY.norm <- subset(rpkm_Dev.norm, rownames(rpkm_Dev.norm) %in% rownames(Y_genes))
+
+#make sex chromosome subsets based just on whole testes data
+cpm_WT_justX <- subset(cpm_WT, rownames(cpm_WT) %in% rownames(X_genes))
+cpm_WT_justY <- subset(cpm_WT, rownames(cpm_WT) %in% rownames(Y_genes))
+rpkm_WT_justX <- subset(rpkm_WT, rownames(rpkm_WT) %in% rownames(X_genes))
+rpkm_WT_justY <- subset(rpkm_WT, rownames(rpkm_WT) %in% rownames(Y_genes))
+rpkm_WT_justX.norm <- subset(rpkm_WT.norm, rownames(rpkm_WT.norm) %in% rownames(X_genes))
+rpkm_WT_justY.norm <- subset(rpkm_WT.norm, rownames(rpkm_WT.norm) %in% rownames(Y_genes))
+
+
+#make cpm, rpkm, and rpkm.norm dataframes for each stage type for each genotype across all X chromosome genes
+for (q in 1:length(stages)){
+  for (r in 1:length(genotypes)) {
+  #subsets for each genotype across stages
+  cpmALL <- cpm_Dev_justX[,grep(genotypes[r], colnames(cpm_Dev_justX))]
+  rpkmALL <- rpkm_Dev_justX[,grep(genotypes[r], colnames(rpkm_Dev_justX))]
+  rpkmALL.norm <- rpkm_Dev_justX.norm[,grep(genotypes[r], colnames(rpkm_Dev_justX.norm))]
+  
+  #print genotype plus stage combination
+  combo_name <- paste(genotypes[r], stages[q], sep = ".*")
+
+  #subsets for each genotype for each stage
+  cpm <- cpm_Dev_justX[,grep(combo_name, colnames(cpm_Dev_justX))]
+  rpkm <- rpkm_Dev_justX[,grep(combo_name, colnames(rpkm_Dev_justX))]
+  rpkm.norm <- rpkm_Dev_justX.norm[,grep(combo_name, colnames(rpkm_Dev_justX.norm))]
+
+  #assign to relevant variable name
+  assign(paste("cpm", genotypes[r], "Dev", "justX", sep = "_"), cpmALL)
+  assign(paste("rpkm", genotypes[r], "Dev", "justX", sep = "_"), rpkmALL)
+  assign(paste(paste("rpkm", genotypes[r], "Dev", "justX", sep = "_"),"norm", sep = "."), rpkmALL.norm)
+  
+  assign(paste("cpm", genotypes[r], stages[q], "Dev", "justX", sep = "_"), cpm)
+  assign(paste("rpkm", genotypes[r], stages[q], "Dev", "justX", sep = "_"), rpkm)
+  assign(paste(paste("rpkm", genotypes[r], stages[q], "Dev", "justX", sep = "_"),"norm", sep = "."), rpkm.norm)
+  }
+}
+
+rm(cpmALL, rpkmALL, rpkmALL.norm)
+rm(cpm, rpkm, rpkm.norm)
+
+#make cpm, rpkm, and rpkm.norm dataframes for each stage type for each genotype across all Y chromosome genes
+for (q in 1:length(stages)){
+  for (r in 1:length(genotypes)) {
+  #subsets for each genotype across stages
+  cpmALL <- cpm_Dev_justY[,grep(genotypes[r], colnames(cpm_Dev_justY))]
+  rpkmALL <- rpkm_Dev_justY[,grep(genotypes[r], colnames(rpkm_Dev_justY))]
+  rpkmALL.norm <- rpkm_Dev_justY.norm[,grep(genotypes[r], colnames(rpkm_Dev_justY.norm))]
+  
+  #print genotype plus stage combination
+  combo_name <- paste(genotypes[r], stages[q], sep = ".*")
+
+  #subsets for each genotype for each stage
+  cpm <- cpm_Dev_justY[,grep(combo_name, colnames(cpm_Dev_justY))]
+  rpkm <- rpkm_Dev_justY[,grep(combo_name, colnames(rpkm_Dev_justY))]
+  rpkm.norm <- rpkm_Dev_justY.norm[,grep(combo_name, colnames(rpkm_Dev_justY.norm))]
+
+  #assign to relevant variable name
+  assign(paste("cpm", genotypes[r], "Dev", "justY", sep = "_"), cpmALL)
+  assign(paste("rpkm", genotypes[r], "Dev", "justY", sep = "_"), rpkmALL)
+  assign(paste(paste("rpkm", genotypes[r], "Dev", "justY", sep = "_"),"norm", sep = "."), rpkmALL.norm)
+  
+  assign(paste("cpm", genotypes[r], stages[q], "Dev", "justY", sep = "_"), cpm)
+  assign(paste("rpkm", genotypes[r], stages[q], "Dev", "justY", sep = "_"), rpkm)
+  assign(paste(paste("rpkm", genotypes[r], stages[q], "Dev", "justY", sep = "_"),"norm", sep = "."), rpkm.norm)
+  }
+}
+
+rm(cpmALL, rpkmALL, rpkmALL.norm)
+rm(cpm, rpkm, rpkm.norm)
+
+#cleanup cpm dataframes; don't run this if you want them for heatmaps
+rm(list=ls(pattern="^cpm_"))
+```
+
+</h3>Expression Levels for each Stage/Genotype<h3>
+```{r}
+cell.list <- c("MSHyb.*SP", "MSHyb.*LZ", "MSHyb.*DIP", "MSHyb.*RS", "MSHyb.*WT", "DFHyb.*SP", "DFHyb.*LZ", "DFHyb.*DIP", "DFHyb.*RS", "DFHyb.*WT", "MusP.*SP", "MusP.*LZ", "MusP.*DIP", "MusP.*RS", "MusP.*WT", "DomP.*SP", "DomP.*LZ", "DomP.*DIP", "DomP.*RS", "DomP.*WT")
+cell.names <- c("MSHyb_SP", "MSHyb_LZ", "MSHyb_DIP", "MSHyb_RS", "MSHyb_WT", "DFHyb_SP", "DFHyb_LZ", "DFHyb_DIP", "DFHyb_RS", "DFHyb_WT", "MusP_SP", "MusP_LZ", "MusP_DIP", "MusP_RS", "MusP_WT", "DomP_SP", "DomP_LZ", "DomP_DIP", "DomP_RS", "DomP_WT")
+
+#un-normalized RPKM
+rpkm.bycell <- data.frame("chr" = annotations[rownames(annotations) %in%  rownames(dgeFull$genes),]$chr)
+rownames(rpkm.bycell) <- rownames(annotations[rownames(annotations) %in%  rownames(dgeFull$genes),])
+for (cell in 1:length(cell.list)) {
+  rpkm.bycell <- cbind(rpkm.bycell, as.data.frame(rowMeans(rpkm_Full[,grep(cell.list[cell],colnames(rpkm_Full))])))
+}
+colnames(rpkm.bycell) <- c("chr", cell.names)
+
+#normalized RPKM; sum of squares
+rpkm.norm.bycell <- data.frame("chr" = annotations[rownames(annotations) %in%  rownames(dgeFull$genes),]$chr)
+rownames(rpkm.norm.bycell) <- rownames(annotations[rownames(annotations) %in%  rownames(dgeFull$genes),])
+for (cell in 1:length(cell.list)) {
+  rpkm.norm.bycell <- cbind(rpkm.norm.bycell, as.data.frame(rowMeans(rpkm_Full.norm[,grep(cell.list[cell],colnames(rpkm_Full.norm))])))
+}
+colnames(rpkm.norm.bycell) <- c("chr", cell.names)
+
+#normalized RPKM; log
+rpkm.log2.bycell <- data.frame("chr" = annotations[rownames(annotations) %in%  rownames(dgeFull$genes),]$chr)
+rownames(rpkm.log2.bycell) <- rownames(annotations[rownames(annotations) %in%  rownames(dgeFull$genes),])
+for (cell in 1:length(cell.list)) {
+  rpkm.log2.bycell <- cbind(rpkm.log2.bycell, as.data.frame(rowMeans(rpkm_Full.log[,grep(cell.list[cell],colnames(rpkm_Full.log))])))
+}
+colnames(rpkm.log2.bycell) <- c("chr", cell.names)
+
+#plot RPKM density
+colors <- rep(c("#D14949","#FFBA08", "#99C665", "#354377", "#874F73"), 2)
+lines <- rep(c(1,5), each = 5)
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file="exported_figures/RPKM_density_all_genes.pdf", width=10, height=8, pointsize=12)
+      for (sample in 1:ncol(rpkm.log2.bycell[, c(2:10)])){
+        plot(density(rpkm.log2.bycell[, sample+1]), col = colors[sample], lty = lines[sample], ylab = "", xaxt = "n", xlab = "", yaxt = "n", main = "", ylim = c(0, 0.18), xlim = c(-10, 13), lwd = 3)
+        par(new = TRUE)
+      }
+      axis(side = 2)
+      axis(side = 1)
+      title(xlab = "Mean RPKM after filtering - all genes", ylab = "Density")
+      legend(-11, 0.19, c("Spermatogonia", "Leptotene/zygotene", "Diplotene", "Round spermatid", "Whole Testes"),
+             lty = c(1), col = colors[1:5], lwd = 3, bty = "n")
+      dev.off()
+    }
+
+for (sample in 1:ncol(rpkm.log2.bycell[, c(2:10)])){
+  plot(density(rpkm.log2.bycell[, sample+1]), col = colors[sample], lty = lines[sample], ylab = "", xaxt = "n", xlab = "", yaxt = "n", main = "", ylim = c(0, 0.18), xlim = c(-10, 13), lwd = 3)
+  par(new = TRUE)
+}
+axis(side = 2)
+axis(side = 1)
+title(xlab = "Mean RPKM after filtering - all genes", ylab = "Density")
+legend(-11, 0.19, c("Spermatogonia", "Leptotene/zygotene", "Diplotene", "Round spermatid", "Whole Testes"),
+       lty = c(1), col = colors[1:5], lwd = 3, bty = "n")
+```
+
+<h3>Defining cell specific expressed genes (for use in hypergeometric tests of DE enrichment)</h3>
+```{r}
+#optimizable; what's the point of this section again 
+#get expressed genes meeting filtering requirements from those DGEs you just set up
+Hyb.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("Hyb.*SP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14651
+Hyb.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("Hyb.*LZ", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 13683
+Hyb.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("Hyb.*DIP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 12883
+Hyb.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("Hyb.*RS", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14735
+Hyb.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,grep("Hyb.*WT", colnames(rpkm_WT))] > rpkm.cutoff)  >= min.reps, ]) # 15470
+
+MSHyb.MusP.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("M.*SP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14373
+MSHyb.MusP.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("M.*LZ", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 13700
+MSHyb.MusP.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("M.*DIP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 12911
+MSHyb.MusP.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("M.*RS", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14720
+MSHyb.MusP.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,grep("M.*WT", colnames(rpkm_WT))] > rpkm.cutoff)  >= min.reps, ]) # 15433
+
+MSHyb.DomP.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("MS.*SP",  colnames(rpkm_Dev)), grep("DomP.*SP", colnames(rpkm_Dev)))]  > rpkm.cutoff)  >= min.reps, ]) # 14694
+MSHyb.DomP.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("MS.*LZ",  colnames(rpkm_Dev)), grep("DomP.*LZ", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 13931
+MSHyb.DomP.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("MS.*DIP", colnames(rpkm_Dev)), grep("DomP.*DIP", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 13005
+MSHyb.DomP.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("MS.*RS",  colnames(rpkm_Dev)), grep("DomP.*RS", colnames(rpkm_Dev)))]  > rpkm.cutoff)  >= min.reps, ]) # 14787
+MSHyb.DomP.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,c(grep("MS.*WT",  colnames(rpkm_WT)), grep("DomP.*WT", colnames(rpkm_WT)))]  > rpkm.cutoff)  >= min.reps, ]) # 15643
+
+DFHyb.MusP.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("DF.*SP",  colnames(rpkm_Dev)), grep("MusP.*SP", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 14350
+DFHyb.MusP.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("DF.*LZ",  colnames(rpkm_Dev)), grep("MusP.*LZ", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 13627
+DFHyb.MusP.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("DF.*DIP", colnames(rpkm_Dev)), grep("MusP.*DIP", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 12674
+DFHyb.MusP.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,c(grep("DF.*RS",  colnames(rpkm_Dev)), grep("MusP.*RS", colnames(rpkm_Dev)))] > rpkm.cutoff)  >= min.reps, ]) # 14479
+DFHyb.MusP.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,c(grep("DF.*WT",  colnames(rpkm_WT)), grep("MusP.*WT", colnames(rpkm_WT)))] > rpkm.cutoff)  >= min.reps, ]) # 15342
+
+DFHyb.DomP.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("D.*SP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14573
+DFHyb.DomP.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("D.*LZ", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 13816
+DFHyb.DomP.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("D.*DIP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 12813
+DFHyb.DomP.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("D.*RS", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14586
+DFHyb.DomP.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,grep("D.*WT", colnames(rpkm_WT))] > rpkm.cutoff)  >= min.reps, ]) # 15514
+
+MusP.DomP.SP.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("P.*SP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14466
+MusP.DomP.LZ.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("P.*LZ", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 13828
+MusP.DomP.DIP.exp <- rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("P.*DIP", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 12864
+MusP.DomP.RS.exp <-  rownames(rpkm_Dev[rowSums(rpkm_Dev[,grep("P.*RS", colnames(rpkm_Dev))] > rpkm.cutoff)  >= min.reps, ]) # 14792
+MusP.DomP.WT.exp <-  rownames(rpkm_WT[rowSums(rpkm_WT[,grep("P.*WT", colnames(rpkm_WT))] > rpkm.cutoff)  >= min.reps, ]) # 15781
+
+hyb.cell.exp.list <- c("Hyb.SP.exp", "Hyb.LZ.exp", "Hyb.DIP.exp", "Hyb.RS.exp", "Hyb.WT.exp")
+par.cell.exp.list <- c("MusP.DomP.SP.exp", "MusP.DomP.LZ.exp", "MusP.DomP.DIP.exp", "MusP.DomP.RS.exp", "MusP.DomP.WT.exp")
+```
+
+<h1>MDS Plots</h1>
+<h3>MDS Plots of Whole Genomes</h3>
+``` {r}
+#color by stage; colors used here are used throughout; Red = SP, Yellow = LZ, Green = DIP, Blue = RS, and Purple = WT
+#SP="#D14949"
+#LZ="#FFBA08"
+#DIP="#99C665"
+#RS="#354377"
+#WT="#874F73"
+
+#function that adjusts MDS plot labels to be more readable
+mds_labels <- function(dge_of_interest) {
+  label_vector <- colnames(dge_of_interest$counts)
+  label_vector <- gsub("-.*","",label_vector)
+  label_vector <- gsub("MusP","mus",label_vector)
+  label_vector <- gsub("DomP","dom",label_vector)
+  label_vector <- gsub("MSHyb","sterile",label_vector)
+  label_vector <- gsub("DFHyb","fertile",label_vector)
+  return(label_vector)
+}
+
+#Full MDS
+#set up color assignments for the plots then actually plotWT
+metadata$stage <- factor(metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[metadata$stage]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_all-stages-all-genotypes_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeFull, col=stage_colors, pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeFull)))))), cex = 2, plot = TRUE, main = "Full dataset with all stages and all genotypes")
+    dev.off()
+    }
+#print again for knitted file
+plotMDS(dgeFull, col=stage_colors, labels = mds_labels(dgeFull), plot = TRUE, main = "Full dataset with all stages and all genotypes")
+
+#WT MDS
+#set up color assignments for the plots then actually plotWT
+WT_metadata <- metadata[grep("WT",metadata$condition_name),]
+WT_metadata$stage <- factor(WT_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[WT_metadata$cross]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_WT-stages-all-genotypes_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeWT, col="#874F73", pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeWT)))))), cex = 2, plot = TRUE, main = "Just whole testes dataset with all stages and all genotypes")
+    dev.off()
+    }
+#this coloring isn't particularly useful
+plotMDS(dgeWT, col="#874F73", labels = mds_labels(dgeWT), plot = TRUE, main = "Just whole testes dataset with all stages and all genotypes")
+
+#Dev MDS
+#set up color assignments for the plots then actually plot
+Dev_metadata <- metadata[grep("WT",metadata$condition_name, invert = TRUE),]
+Dev_metadata$stage <- factor(Dev_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[Dev_metadata$stage]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_Dev-stages-all-genotypes_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeDev, col=stage_colors, pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeDev)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeDev, col=stage_colors, labels = mds_labels(dgeDev), plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes")
+```
+
+<h3>MDSPlots For Each Stage Colored By Genotype</h3>
+``` {r}
+#SP MDS
+#set up color assignments for the plots then actually plot
+sp_metadata <- metadata[grep("SP",metadata$condition_name),]
+sp_metadata$cross <- factor(sp_metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+geno_colors <- c("#D14949", "#354377", "#A77F99", "#4A2C3F")[sp_metadata$cross]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file="exported_figures/MDS_SP-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeSP, col="#D14949", pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeSP)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with SP and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeSP, col="#D14949", labels = mds_labels(dgeSP), plot = TRUE, main = "Just sorted cell dataset with SP and all genotypes")
+
+#LZ MDS
+#set up color assignments for the plots then actually plot
+LZ_metadata <- metadata[grep("LZ",metadata$condition_name),]
+LZ_metadata$cross <- factor(LZ_metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+geno_colors <- c("#D14949", "#354377", "#A77F99", "#4A2C3F")[LZ_metadata$cross]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_LZ-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeLZ, col="#FFBA08", pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeLZ)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with LZ and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeLZ, col="#FFBA08", labels = mds_labels(dgeLZ), plot = TRUE, main = "Just sorted cell dataset with LZ and all genotypes")
+
+#DIP MDS
+#set up color assignments for the plots then actually plot
+DIP_metadata <- metadata[grep("DIP",metadata$condition_name),]
+DIP_metadata$cross <- factor(DIP_metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+geno_colors <- c("#D14949", "#354377", "#A77F99", "#4A2C3F")[DIP_metadata$cross]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_DIP-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeDIP, col="#99C665", pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeDIP)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with DIP and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeDIP, col="#99C665", labels = mds_labels(dgeDIP), plot = TRUE, main = "Just sorted cell dataset with DIP and all genotypes")
+
+#RS MDS
+#set up color assignments for the plots then actually plot
+RS_metadata <- metadata[grep("RS",metadata$condition_name),]
+RS_metadata$cross <- factor(RS_metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+geno_colors <- c("#D14949", "#354377", "#A77F99", "#4A2C3F")[RS_metadata$cross]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_RS-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeRS, col="#354377", pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeRS)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with RS and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeRS, col="#354377", labels = mds_labels(dgeRS), plot = TRUE, main = "Just sorted cell dataset with RS and all genotypes")
+
+rm(dgeSP, dgeLZ, dgeDIP, dgeRS)
+```
+
+<h3>MDSPlots For Each Genotype Colored By Stage for sorted cell and sorted cell+whole testes datasets</h3>
+<h5>MusP</h5>
+``` {r}
+#MusP MDS - full
+#set up color assignments for the plots then actually plot
+MusP_metadata <- metadata[grep("MusP",metadata$condition_name),]
+MusP_metadata$stage <- factor(MusP_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[MusP_metadata$stage]
+plotMDS(dgeMusP, col=stage_colors, main = "All MusP samples colored by stage")
+
+#MusP MDS - dev
+#set up color assignments for the plots then actually plot
+MusP_metadata <- Dev_metadata[grep("MusP",Dev_metadata$condition_name),]
+MusP_metadata$stage <- factor(MusP_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[MusP_metadata$stage]
+plotMDS(dgeMusPDev, col=stage_colors, main = "Just Sorted Cell's MusP samples colored by stage")
+
+rm(dgeMusP, dgeMusPDev)
+```
+<h5>DomP</h5>
+``` {r}
+#DomP MDS
+#set up color assignments for the plots then actually plot
+DomP_metadata <- metadata[grep("DomP",metadata$condition_name),]
+DomP_metadata$stage <- factor(DomP_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[DomP_metadata$stage]
+plotMDS(dgeDomP, col=stage_colors, main = "All DomP samples colored by stage")
+
+#DomP MDS - dev
+#set up color assignments for the plots then actually plot
+DomP_metadata <- Dev_metadata[grep("DomP",Dev_metadata$condition_name),]
+DomP_metadata$stage <- factor(DomP_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[DomP_metadata$stage]
+plotMDS(dgeDomPDev, col=stage_colors, main = "Just Sorted Cell's DomP samples colored by stage")
+
+rm(dgeDomP, dgeDomPDev)
+```
+<h5>MSHyb</h5>
+``` {r}
+#MSHyb MDS
+#set up color assignments for the plots then actually plot
+MSHyb_metadata <- metadata[grep("MSHyb",metadata$condition_name),]
+MSHyb_metadata$stage <- factor(MSHyb_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[MSHyb_metadata$stage]
+
+plotMDS(dgeMSHyb, col=stage_colors, main = "All MSHyb samples colored by stage")
+
+#MSHyb MDS - dev
+#set up color assignments for the plots then actually plot
+MSHyb_metadata <- Dev_metadata[grep("MSHyb",Dev_metadata$condition_name),]
+MSHyb_metadata$stage <- factor(MSHyb_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[MSHyb_metadata$stage]
+plotMDS(dgeMSHybDev, col=stage_colors, main = "Just Sorted Cell's MSHyb samples colored by stage")
+
+rm(dgeMSHyb, dgeMSHybDev)
+```
+<h5>DFHyb</h5>
+``` {r}
+#DFHyb MDS
+#set up color assignments for the plots then actually plot
+DFHyb_metadata <- metadata[grep("DFHyb",metadata$condition_name),]
+DFHyb_metadata$stage <- factor(DFHyb_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[DFHyb_metadata$stage]
+plotMDS(dgeDFHyb, col=stage_colors, main = "All DFHyb samples colored by stage")
+
+#DFHyb MDS - dev
+#set up color assignments for the plots then actually plot
+DFHyb_metadata <- Dev_metadata[grep("DFHyb",Dev_metadata$condition_name),]
+DFHyb_metadata$stage <- factor(DFHyb_metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[DFHyb_metadata$stage]
+plotMDS(dgeDFHybDev, col=stage_colors, main = "Just Sorted Cell's DFHyb samples colored by stage")
+
+rm(dgeDFHyb, dgeDFHybDev)
+```
+
+<h1>Sex Chromosome Analysis</h1>
+
+<h3>X and Y Chromosome MDSPlots</h3>
+```{r}
+#all X
+metadata$cross <- factor(metadata$cross, levels = c("MusP", "DomP", "MSHXb", "DFHXb"))
+metadata$stage <- factor(metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[metadata$stage]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_X_Full-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeX_Full, col=stage_colors, pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeX_Full)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes X chromosome")
+    dev.off()
+    }
+plotMDS(dgeX_Full, col=stage_colors, labels = mds_labels(dgeX_Full), plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes")
+
+#all Y
+metadata$cross <- factor(metadata$cross, levels = c("MusP", "DomP", "MSHyb", "DFHyb"))
+metadata$stage <- factor(metadata$stage, levels = c("SP", "LZ", "DIP", "RS", "WT"))
+stage_colors <- c("#D14949","#FFBA08","#99C665","#354377","#874F73")[metadata$stage]
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file = "exported_figures/MDS_Y_Full-all-genotypes_color_by_geno_symbols.pdf", width=5, height=4, pointsize=12)
+    plotMDS(dgeY_Full, col=stage_colors, pch = as.numeric(gsub("fertile", 1, gsub("sterile", 4, gsub("dom", 6, gsub("mus", 2, mds_labels(dgeX_Full)))))), cex = 2, plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes")
+    dev.off()
+    }
+plotMDS(dgeY_Full, col=stage_colors, labels = mds_labels(dgeY_Full), plot = TRUE, main = "Just sorted cell dataset with all stages and all genotypes Y chromosome")
+
+rm(dgeX_Full, dgeY_Full)
+```
+
+<h1>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) for the X chromosome from all data</h1>
+``` {r include = TRUE}
+#Heatmap(as.matrix(cpm_justX), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_justX), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+    #change exportFigs to TRUE to export as PDF if desired
+
+    pdf(file="exported_figures/Heatmap_justX_all-genotypes_all_stages.pdf", width=10, height=8, pointsize=12)
+    Heatmap(as.matrix(rpkm_justX.norm), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+    dev.off()
+
+Heatmap(as.matrix(rpkm_justX.norm), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+```
+
+<h3>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) for the X chromosome from all hybrids using full dataset/h3>
+``` {r include = TRUE}
+#Heatmap(as.matrix(cpm_DFHyb_justX), column_order = DFHyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_DFHyb_justX), column_order = DFHyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+    #change exportFigs to TRUE to export as PDF if desired
+
+    pdf(file="exported_figures/Heatmap_justX_Hybrids_all_stages.pdf", width=10, height=8, pointsize=12)
+    Heatmap(as.matrix(cbind(rpkm_DFHyb_justX.norm, rpkm_MSHyb_justX.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+    dev.off()
+ 
+Heatmap(as.matrix(cbind(rpkm_DFHyb_justX.norm, rpkm_MSHyb_justX.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+```
+
+<h1>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) for the Y chromosome from all data</h1>
+``` {r include = TRUE}
+#Heatmap(as.matrix(cpm_justY), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_justY), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+    #change exportFigs to TRUE to export as PDF if desired
+
+    pdf(file="exported_figures/Heatmap_justY_all_genotypes_all_stages.pdf", width=10, height=8, pointsize=12)
+    Heatmap(as.matrix(rpkm_justY.norm), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+    dev.off()
+ 
+Heatmap(as.matrix(rpkm_justY.norm), column_order = heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+```
+
+<h3>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) for the X chromosome from all hybrids using full dataset/h3>
+``` {r include = TRUE}
+#Heatmap(as.matrix(cpm_DFHyb_justX), column_order = DFHyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_DFHyb_justX), column_order = DFHyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+    #change exportFigs to TRUE to export as PDF if desired
+
+    pdf(file="exported_figures/Heatmap_justY_Hybrids_all_stages.pdf", width=10, height=8, pointsize=12)
+    Heatmap(as.matrix(cbind(rpkm_DFHyb_justY.norm, rpkm_MSHyb_justY.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+    dev.off()
+ 
+Heatmap(as.matrix(cbind(rpkm_DFHyb_justY.norm, rpkm_MSHyb_justY.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE)
+```
+
+Expressed on X in diplotene
+```{r}
+#get the number of X-linked genes and mean/median/min/max RPKM for each stage/genotype combination
+X_SP_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_SP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_SP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_SP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_SP_justX > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_SP_justX[rowSums(rpkm_DomP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_SP_justX[rowSums(rpkm_MusP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_SP_justX[rowSums(rpkm_MSHyb_SP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_SP_justX[rowSums(rpkm_DFHyb_SP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_SP_justX[rowSums(rpkm_DomP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_SP_justX[rowSums(rpkm_MusP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_SP_justX[rowSums(rpkm_MSHyb_SP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_SP_justX[rowSums(rpkm_DFHyb_SP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_SP_justX[rowSums(rpkm_DomP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_SP_justX[rowSums(rpkm_MusP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_SP_justX[rowSums(rpkm_MSHyb_SP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_SP_justX[rowSums(rpkm_DFHyb_SP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_SP_justX[rowSums(rpkm_DomP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_SP_justX[rowSums(rpkm_MusP_SP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_SP_justX[rowSums(rpkm_MSHyb_SP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_SP_justX[rowSums(rpkm_DFHyb_SP_justX > rpkm.cutoff) >= min.reps,])))))
+
+colnames(X_SP_summary_stats) <- c("DomP-SP", "MusP-SP", "MSHyb-SP", "DFHyb-SP")
+
+#larson x LZ
+X_LZ_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_LZ_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_LZ_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_LZ_justX[rowSums(rpkm_DomP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_LZ_justX[rowSums(rpkm_MusP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_LZ_justX[rowSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_LZ_justX[rowSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_LZ_justX[rowSums(rpkm_DomP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_LZ_justX[rowSums(rpkm_MusP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_LZ_justX[rowSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_LZ_justX[rowSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_LZ_justX[rowSums(rpkm_DomP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_LZ_justX[rowSums(rpkm_MusP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_LZ_justX[rowSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_LZ_justX[rowSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_LZ_justX[rowSums(rpkm_DomP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_LZ_justX[rowSums(rpkm_MusP_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_LZ_justX[rowSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_LZ_justX[rowSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff) >= min.reps,])))))
+
+colnames(X_LZ_summary_stats) <- c("DomP-LZ", "MusP-LZ", "MSHyb-LZ", "DFHyb-LZ")
+
+#larson x DIP
+X_DIP_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_DIP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_DIP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_DIP_justX[rowSums(rpkm_DomP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_DIP_justX[rowSums(rpkm_MusP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_DIP_justX[rowSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_DIP_justX[rowSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_DIP_justX[rowSums(rpkm_DomP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_DIP_justX[rowSums(rpkm_MusP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_DIP_justX[rowSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_DIP_justX[rowSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_DIP_justX[rowSums(rpkm_DomP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_DIP_justX[rowSums(rpkm_MusP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_DIP_justX[rowSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_DIP_justX[rowSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_DIP_justX[rowSums(rpkm_DomP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_DIP_justX[rowSums(rpkm_MusP_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_DIP_justX[rowSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_DIP_justX[rowSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff) >= min.reps,])))))
+
+colnames(X_DIP_summary_stats) <- c("DomP-DIP", "MusP-DIP", "MSHyb-DIP", "DFHyb-DIP")
+
+#larson x RS
+X_RS_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_RS_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_RS_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_RS_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_RS_justX > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_RS_justX[rowSums(rpkm_DomP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_RS_justX[rowSums(rpkm_MusP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_RS_justX[rowSums(rpkm_MSHyb_RS_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_RS_justX[rowSums(rpkm_DFHyb_RS_justX > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_RS_justX[rowSums(rpkm_DomP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_RS_justX[rowSums(rpkm_MusP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_RS_justX[rowSums(rpkm_MSHyb_RS_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_RS_justX[rowSums(rpkm_DFHyb_RS_justX > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_RS_justX[rowSums(rpkm_DomP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_RS_justX[rowSums(rpkm_MusP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_RS_justX[rowSums(rpkm_MSHyb_RS_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_RS_justX[rowSums(rpkm_DFHyb_RS_justX > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_RS_justX[rowSums(rpkm_DomP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_RS_justX[rowSums(rpkm_MusP_RS_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_RS_justX[rowSums(rpkm_MSHyb_RS_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_RS_justX[rowSums(rpkm_DFHyb_RS_justX > rpkm.cutoff) >= min.reps,])))))
+
+colnames(X_RS_summary_stats) <- c("DomP-RS", "MusP-RS", "MSHyb-RS", "DFHyb-RS")
+
+#mack x WT
+X_WT_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_WT_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_WT_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_WT_justX > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_WT_justX > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_WT_justX[rowSums(rpkm_DomP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_WT_justX[rowSums(rpkm_MusP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_WT_justX[rowSums(rpkm_MSHyb_WT_justX > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_WT_justX[rowSums(rpkm_DFHyb_WT_justX > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_WT_justX[rowSums(rpkm_DomP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_WT_justX[rowSums(rpkm_MusP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_WT_justX[rowSums(rpkm_MSHyb_WT_justX > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_WT_justX[rowSums(rpkm_DFHyb_WT_justX > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_WT_justX[rowSums(rpkm_DomP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_WT_justX[rowSums(rpkm_MusP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_WT_justX[rowSums(rpkm_MSHyb_WT_justX > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_WT_justX[rowSums(rpkm_DFHyb_WT_justX > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_WT_justX[rowSums(rpkm_DomP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_WT_justX[rowSums(rpkm_MusP_WT_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_WT_justX[rowSums(rpkm_MSHyb_WT_justX > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_WT_justX[rowSums(rpkm_DFHyb_WT_justX > rpkm.cutoff) >= min.reps,])))))
+
+colnames(X_WT_summary_stats) <- c("DomP-WT", "MusP-WT", "MSHyb-WT", "DFHyb-WT")
+
+X_SP_summary_stats
+X_LZ_summary_stats
+X_DIP_summary_stats
+X_RS_summary_stats
+X_WT_summary_stats
+
+#combined stages
+rownames(X_SP_summary_stats) <- c("N-SP", "Mean-SP", "Median-SP", "Min-SP", "Max-SP")
+rownames(X_LZ_summary_stats) <- c("N-LZ", "Mean-LZ", "Median-LZ", "Min-LZ", "Max-LZ")
+rownames(X_DIP_summary_stats) <- c("N-DIP", "Mean-DIP", "Median-DIP", "Min-DIP", "Max-DIP")
+rownames(X_RS_summary_stats) <- c("N-RS", "Mean-RS", "Median-RS", "Min-RS", "Max-RS")
+rownames(X_WT_summary_stats) <- c("N-WT", "Mean-WT", "Median-WT", "Min-WT", "Max-WT")
+
+X_ALL_summary_stats <- rbind(X_SP_summary_stats, X_LZ_summary_stats, X_DIP_summary_stats, X_RS_summary_stats, X_WT_summary_stats)
+X_ALL_summary_stats[grep("N", rownames(X_ALL_summary_stats)),]
+```
+
+X-Linked ANOVA
+```{r}
+#set up dataframes for SP comps
+SP_X_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_SP_justX > rpkm.cutoff),
+           colSums(rpkm_MusP_SP_justX > rpkm.cutoff),
+           colSums(rpkm_MSHyb_SP_justX > rpkm.cutoff),
+           colSums(rpkm_DFHyb_SP_justX > rpkm.cutoff)))           
+SP_X_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(SP_X_df_for_ANOVA))
+colnames(SP_X_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+SP_X_df_for_ANOVA$Treatment <- ordered(SP_X_df_for_ANOVA$Treatment, levels = c("DomP-SP","MusP-SP", "MSHyb-SP", "DFHyb-SP"))
+
+#perform ANOVA
+SP_X.aov <- aov(N_Genes ~ Treatment, data = SP_X_df_for_ANOVA)
+# Summary of the analysis
+summary(SP_X.aov)
+#Tukey's
+SP_X.tukey <- TukeyHSD(SP_X.aov)
+
+#letter dataframe for plotting
+SP_X.letters <- TukeyHSD(SP_X.aov, conf.level = 0.95)$Treatment[,4]
+names(SP_X.letters) <- gsub("-SP", "_SP", names(SP_X.letters))
+SP_X.letters <- data.frame(multcompView::multcompLetters(SP_X.letters)$Letters)
+rownames(SP_X.letters) <- gsub("_SP", "-SP", rownames(SP_X.letters))
+SP_X.letters$treatment=rownames(SP_X.letters)
+colnames(SP_X.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=SP_X_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-SP","MusP-SP", "MSHyb-SP", "DFHyb-SP"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(SP_X.letters, yvalue)
+
+SP_X_ANOVA_boxplot <- ggplot(SP_X_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number X-Linked SP Genes') +
+  geom_boxplot(fill = '#D14949', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for LZ comps
+LZ_X_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_LZ_justX > rpkm.cutoff),
+           colSums(rpkm_MusP_LZ_justX > rpkm.cutoff),
+           colSums(rpkm_MSHyb_LZ_justX > rpkm.cutoff),
+           colSums(rpkm_DFHyb_LZ_justX > rpkm.cutoff)))           
+LZ_X_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(LZ_X_df_for_ANOVA))
+colnames(LZ_X_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+LZ_X_df_for_ANOVA$Treatment <- ordered(LZ_X_df_for_ANOVA$Treatment, levels = c("DomP-LZ","MusP-LZ", "MSHyb-LZ", "DFHyb-LZ"))
+
+#perform ANOVA
+LZ_X.aov <- aov(N_Genes ~ Treatment, data = LZ_X_df_for_ANOVA)
+# Summary of the analysis
+summary(LZ_X.aov)
+#Tukey's
+LZ_X.tukey <- TukeyHSD(LZ_X.aov)
+
+#letter dataframe for plotting
+LZ_X.letters <- TukeyHSD(LZ_X.aov, conf.level = 0.95)$Treatment[,4]
+names(LZ_X.letters) <- gsub("-LZ", "_LZ", names(LZ_X.letters))
+LZ_X.letters <- data.frame(multcompView::multcompLetters(LZ_X.letters)$Letters)
+rownames(LZ_X.letters) <- gsub("_LZ", "-LZ", rownames(LZ_X.letters))
+LZ_X.letters$treatment=rownames(LZ_X.letters)
+colnames(LZ_X.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=LZ_X_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-LZ","MusP-LZ", "MSHyb-LZ", "DFHyb-LZ"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(LZ_X.letters, yvalue)
+
+LZ_X_ANOVA_boxplot <- ggplot(LZ_X_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number X-Linked LZ Genes') +
+  geom_boxplot(fill = '#FFBA08', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for DIP comps
+DIP_X_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_DIP_justX > rpkm.cutoff),
+           colSums(rpkm_MusP_DIP_justX > rpkm.cutoff),
+           colSums(rpkm_MSHyb_DIP_justX > rpkm.cutoff),
+           colSums(rpkm_DFHyb_DIP_justX > rpkm.cutoff)))           
+DIP_X_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(DIP_X_df_for_ANOVA))
+colnames(DIP_X_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+DIP_X_df_for_ANOVA$Treatment <- ordered(DIP_X_df_for_ANOVA$Treatment, levels = c("DomP-DIP","MusP-DIP", "MSHyb-DIP", "DFHyb-DIP"))
+
+#perform ANOVA
+DIP_X.aov <- aov(N_Genes ~ Treatment, data = DIP_X_df_for_ANOVA)
+# Summary of the analysis
+summary(DIP_X.aov)
+#Tukey's
+DIP_X.tukey <- TukeyHSD(DIP_X.aov)
+
+#letter dataframe for plotting
+DIP_X.letters <- TukeyHSD(DIP_X.aov, conf.level = 0.95)$Treatment[,4]
+names(DIP_X.letters) <- gsub("-DIP", "_DIP", names(DIP_X.letters))
+DIP_X.letters <- data.frame(multcompView::multcompLetters(DIP_X.letters)$Letters)
+rownames(DIP_X.letters) <- gsub("_DIP", "-DIP", rownames(DIP_X.letters))
+DIP_X.letters$treatment=rownames(DIP_X.letters)
+colnames(DIP_X.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=DIP_X_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-DIP","MusP-DIP", "MSHyb-DIP", "DFHyb-DIP"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(DIP_X.letters, yvalue)
+
+DIP_X_ANOVA_boxplot <- ggplot(DIP_X_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number X-Linked DIP Genes') +
+  geom_boxplot(fill = '#99C665', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for RS comps
+RS_X_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_RS_justX > rpkm.cutoff),
+           colSums(rpkm_MusP_RS_justX > rpkm.cutoff),
+           colSums(rpkm_MSHyb_RS_justX > rpkm.cutoff),
+           colSums(rpkm_DFHyb_RS_justX > rpkm.cutoff)))           
+RS_X_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(RS_X_df_for_ANOVA))
+colnames(RS_X_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+RS_X_df_for_ANOVA$Treatment <- ordered(RS_X_df_for_ANOVA$Treatment, levels = c("DomP-RS","MusP-RS", "MSHyb-RS", "DFHyb-RS"))
+
+#perform ANOVA
+RS_X.aov <- aov(N_Genes ~ Treatment, data = RS_X_df_for_ANOVA)
+# Summary of the analysis
+summary(RS_X.aov)
+#Tukey's
+RS_X.tukey <- TukeyHSD(RS_X.aov)
+
+#letter dataframe for plotting
+RS_X.letters <- TukeyHSD(RS_X.aov, conf.level = 0.95)$Treatment[,4]
+names(RS_X.letters) <- gsub("-RS", "_RS", names(RS_X.letters))
+RS_X.letters <- data.frame(multcompView::multcompLetters(RS_X.letters)$Letters)
+rownames(RS_X.letters) <- gsub("_RS", "-RS", rownames(RS_X.letters))
+RS_X.letters$treatment=rownames(RS_X.letters)
+colnames(RS_X.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=RS_X_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-RS","MusP-RS", "MSHyb-RS", "DFHyb-RS"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(RS_X.letters, yvalue)
+
+RS_X_ANOVA_boxplot <- ggplot(RS_X_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number X-Linked RS Genes') +
+  geom_boxplot(fill = '#354377', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+#set up dataframes for WT comps
+WT_X_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_WT_justX > rpkm.cutoff),
+           colSums(rpkm_MusP_WT_justX > rpkm.cutoff),
+           colSums(rpkm_MSHyb_WT_justX > rpkm.cutoff),
+           colSums(rpkm_DFHyb_WT_justX > rpkm.cutoff)))           
+WT_X_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(WT_X_df_for_ANOVA))
+colnames(WT_X_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+WT_X_df_for_ANOVA$Treatment <- ordered(WT_X_df_for_ANOVA$Treatment, levels = c("DomP-WT","MusP-WT", "MSHyb-WT", "DFHyb-WT"))
+
+#perform ANOVA
+WT_X.aov <- aov(N_Genes ~ Treatment, data = WT_X_df_for_ANOVA)
+# Summary of the analysis
+summary(WT_X.aov)
+#Tukey's
+WT_X.tukey <- TukeyHSD(WT_X.aov)
+
+#letter dataframe for plotting
+WT_X.Letters <- TukeyHSD(WT_X.aov, conf.level = 0.95)$Treatment[,4]
+names(WT_X.Letters) <- gsub("-WT", "_WT", names(WT_X.Letters))
+WT_X.Letters <- data.frame(multcompView::multcompLetters(WT_X.Letters)$Letters)
+rownames(WT_X.Letters) <- gsub("_WT", "-WT", rownames(WT_X.Letters))
+WT_X.Letters$treatment=rownames(WT_X.Letters)
+colnames(WT_X.Letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=WT_X_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-WT","MusP-WT", "MSHyb-WT", "DFHyb-WT"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(WT_X.Letters, yvalue)
+
+WT_X_ANOVA_boxplot <- ggplot(WT_X_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number X-Linked WT Genes') +
+  geom_boxplot(fill = '#874F73', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+SP_X_ANOVA_boxplot
+LZ_X_ANOVA_boxplot
+DIP_X_ANOVA_boxplot
+RS_X_ANOVA_boxplot
+WT_X_ANOVA_boxplot
+
+ggsave("exported_figures/DIP_X_ANOVA_boxplot.pdf", DIP_X_ANOVA_boxplot)
+ggsave("exported_figures/RS_X_ANOVA_boxplot.pdf", RS_X_ANOVA_boxplot)
+ggsave("exported_figures/WT_X_ANOVA_boxplot.pdf", WT_X_ANOVA_boxplot)
+
+```
+
+Expressed on Y in diplotene
+```{r error=TRUE}
+#get the number of Y-linked genes and mean/median/min/max RPKM for each stage/genotype combination
+Y_SP_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_SP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_SP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_SP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_SP_justY > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_SP_justY[rowSums(rpkm_DomP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_SP_justY[rowSums(rpkm_MusP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_SP_justY[rowSums(rpkm_MSHyb_SP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_SP_justY[rowSums(rpkm_DFHyb_SP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_SP_justY[rowSums(rpkm_DomP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_SP_justY[rowSums(rpkm_MusP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_SP_justY[rowSums(rpkm_MSHyb_SP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_SP_justY[rowSums(rpkm_DFHyb_SP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_SP_justY[rowSums(rpkm_DomP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_SP_justY[rowSums(rpkm_MusP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_SP_justY[rowSums(rpkm_MSHyb_SP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_SP_justY[rowSums(rpkm_DFHyb_SP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_SP_justY[rowSums(rpkm_DomP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_SP_justY[rowSums(rpkm_MusP_SP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_SP_justY[rowSums(rpkm_MSHyb_SP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_SP_justY[rowSums(rpkm_DFHyb_SP_justY > rpkm.cutoff) >= min.reps,])))))
+
+colnames(Y_SP_summary_stats) <- c("DomP-SP", "MusP-SP", "MSHyb-SP", "DFHyb-SP")
+
+#larson Y LZ
+Y_LZ_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_LZ_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_LZ_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_LZ_justY[rowSums(rpkm_DomP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_LZ_justY[rowSums(rpkm_MusP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_LZ_justY[rowSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_LZ_justY[rowSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_LZ_justY[rowSums(rpkm_DomP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_LZ_justY[rowSums(rpkm_MusP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_LZ_justY[rowSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_LZ_justY[rowSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_LZ_justY[rowSums(rpkm_DomP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_LZ_justY[rowSums(rpkm_MusP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_LZ_justY[rowSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_LZ_justY[rowSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_LZ_justY[rowSums(rpkm_DomP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_LZ_justY[rowSums(rpkm_MusP_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_LZ_justY[rowSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_LZ_justY[rowSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff) >= min.reps,])))))
+
+colnames(Y_LZ_summary_stats) <- c("DomP-LZ", "MusP-LZ", "MSHyb-LZ", "DFHyb-LZ")
+
+#larson Y DIP
+Y_DIP_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_DIP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_DIP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_DIP_justY[rowSums(rpkm_DomP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_DIP_justY[rowSums(rpkm_MusP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_DIP_justY[rowSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_DIP_justY[rowSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_DIP_justY[rowSums(rpkm_DomP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_DIP_justY[rowSums(rpkm_MusP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_DIP_justY[rowSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_DIP_justY[rowSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_DIP_justY[rowSums(rpkm_DomP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_DIP_justY[rowSums(rpkm_MusP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_DIP_justY[rowSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_DIP_justY[rowSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_DIP_justY[rowSums(rpkm_DomP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_DIP_justY[rowSums(rpkm_MusP_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_DIP_justY[rowSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_DIP_justY[rowSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff) >= min.reps,])))))
+
+colnames(Y_DIP_summary_stats) <- c("DomP-DIP", "MusP-DIP", "MSHyb-DIP", "DFHyb-DIP")
+
+#larson Y RS
+Y_RS_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_RS_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_RS_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_RS_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_RS_justY > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_RS_justY[rowSums(rpkm_DomP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_RS_justY[rowSums(rpkm_MusP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_RS_justY[rowSums(rpkm_MSHyb_RS_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_RS_justY[rowSums(rpkm_DFHyb_RS_justY > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_RS_justY[rowSums(rpkm_DomP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_RS_justY[rowSums(rpkm_MusP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_RS_justY[rowSums(rpkm_MSHyb_RS_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_RS_justY[rowSums(rpkm_DFHyb_RS_justY > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_RS_justY[rowSums(rpkm_DomP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_RS_justY[rowSums(rpkm_MusP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_RS_justY[rowSums(rpkm_MSHyb_RS_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_RS_justY[rowSums(rpkm_DFHyb_RS_justY > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_RS_justY[rowSums(rpkm_DomP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_RS_justY[rowSums(rpkm_MusP_RS_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_RS_justY[rowSums(rpkm_MSHyb_RS_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_RS_justY[rowSums(rpkm_DFHyb_RS_justY > rpkm.cutoff) >= min.reps,])))))
+
+colnames(Y_RS_summary_stats) <- c("DomP-RS", "MusP-RS", "MSHyb-RS", "DFHyb-RS")
+
+#mack x WT
+Y_WT_summary_stats <- rbind("N" = c(sum(rowSums(rpkm_DomP_WT_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MusP_WT_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_MSHyb_WT_justY > rpkm.cutoff)  >= min.reps),
+sum(rowSums(rpkm_DFHyb_WT_justY > rpkm.cutoff)  >= min.reps)),
+
+"mean" = c(mean(rowMedians(as.matrix(rpkm_DomP_WT_justY[rowSums(rpkm_DomP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MusP_WT_justY[rowSums(rpkm_MusP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_MSHyb_WT_justY[rowSums(rpkm_MSHyb_WT_justY > rpkm.cutoff) >= min.reps,]))),
+mean(rowMedians(as.matrix(rpkm_DFHyb_WT_justY[rowSums(rpkm_DFHyb_WT_justY > rpkm.cutoff) >= min.reps,])))),
+
+"median" = c(median(rowMedians(as.matrix(rpkm_DomP_WT_justY[rowSums(rpkm_DomP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MusP_WT_justY[rowSums(rpkm_MusP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_MSHyb_WT_justY[rowSums(rpkm_MSHyb_WT_justY > rpkm.cutoff) >= min.reps,]))),
+median(rowMedians(as.matrix(rpkm_DFHyb_WT_justY[rowSums(rpkm_DFHyb_WT_justY > rpkm.cutoff) >= min.reps,])))),
+
+"min" = c(min(rowMedians(as.matrix(rpkm_DomP_WT_justY[rowSums(rpkm_DomP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MusP_WT_justY[rowSums(rpkm_MusP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_MSHyb_WT_justY[rowSums(rpkm_MSHyb_WT_justY > rpkm.cutoff) >= min.reps,]))),
+min(rowMedians(as.matrix(rpkm_DFHyb_WT_justY[rowSums(rpkm_DFHyb_WT_justY > rpkm.cutoff) >= min.reps,])))),
+
+"max" = c(max(rowMedians(as.matrix(rpkm_DomP_WT_justY[rowSums(rpkm_DomP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MusP_WT_justY[rowSums(rpkm_MusP_WT_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_MSHyb_WT_justY[rowSums(rpkm_MSHyb_WT_justY > rpkm.cutoff) >= min.reps,]))),
+max(rowMedians(as.matrix(rpkm_DFHyb_WT_justY[rowSums(rpkm_DFHyb_WT_justY > rpkm.cutoff) >= min.reps,])))))
+
+colnames(Y_WT_summary_stats) <- c("DomP-WT", "MusP-WT", "MSHyb-WT", "DFHyb-WT")
+
+Y_SP_summary_stats
+Y_LZ_summary_stats
+Y_DIP_summary_stats
+Y_RS_summary_stats
+Y_WT_summary_stats
+
+#combined stages
+rownames(Y_SP_summary_stats) <- c("N-SP", "Mean-SP", "Median-SP", "Min-SP", "Max-SP")
+rownames(Y_LZ_summary_stats) <- c("N-LZ", "Mean-LZ", "Median-LZ", "Min-LZ", "Max-LZ")
+rownames(Y_DIP_summary_stats) <- c("N-DIP", "Mean-DIP", "Median-DIP", "Min-DIP", "Max-DIP")
+rownames(Y_RS_summary_stats) <- c("N-RS", "Mean-RS", "Median-RS", "Min-RS", "Max-RS")
+rownames(Y_WT_summary_stats) <- c("N-WT", "Mean-WT", "Median-WT", "Min-WT", "Max-WT")
+
+Y_ALL_summary_stats <- rbind(Y_SP_summary_stats, Y_LZ_summary_stats, Y_DIP_summary_stats, Y_RS_summary_stats, Y_WT_summary_stats)
+
+Y_ALL_summary_stats[grep("N", rownames(Y_ALL_summary_stats)),]
+```
+
+Y-Linked ANOVA
+```{r}
+#set up dataframes for SP comps
+SP_Y_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_SP_justY > rpkm.cutoff),
+           colSums(rpkm_MusP_SP_justY > rpkm.cutoff),
+           colSums(rpkm_MSHyb_SP_justY > rpkm.cutoff),
+           colSums(rpkm_DFHyb_SP_justY > rpkm.cutoff)))           
+SP_Y_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(SP_Y_df_for_ANOVA))
+colnames(SP_Y_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+SP_Y_df_for_ANOVA$Treatment <- ordered(SP_Y_df_for_ANOVA$Treatment, levels = c("DomP-SP","MusP-SP", "MSHyb-SP", "DFHyb-SP"))
+
+#perform ANOVA
+SP_Y.aov <- aov(N_Genes ~ Treatment, data = SP_Y_df_for_ANOVA)
+# Summary of the analysis
+summary(SP_Y.aov)
+#Tukey's
+SP_Y.tukey <- TukeyHSD(SP_Y.aov)
+
+#letter dataframe for plotting
+SP_Y.letters <- TukeyHSD(SP_Y.aov, conf.level = 0.95)$Treatment[,4]
+names(SP_Y.letters) <- gsub("-SP", "_SP", names(SP_Y.letters))
+SP_Y.letters <- data.frame(multcompView::multcompLetters(SP_Y.letters)$Letters)
+rownames(SP_Y.letters) <- gsub("_SP", "-SP", rownames(SP_Y.letters))
+SP_Y.letters$treatment=rownames(SP_Y.letters)
+colnames(SP_Y.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=SP_Y_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-SP","MusP-SP", "MSHyb-SP", "DFHyb-SP"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(SP_Y.letters, yvalue)
+
+SP_Y_ANOVA_boxplot <- ggplot(SP_Y_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number Y-Linked SP Genes') +
+  geom_boxplot(fill = '#D14949', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for LZ comps
+LZ_Y_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_LZ_justY > rpkm.cutoff),
+           colSums(rpkm_MusP_LZ_justY > rpkm.cutoff),
+           colSums(rpkm_MSHyb_LZ_justY > rpkm.cutoff),
+           colSums(rpkm_DFHyb_LZ_justY > rpkm.cutoff)))           
+LZ_Y_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(LZ_Y_df_for_ANOVA))
+colnames(LZ_Y_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+LZ_Y_df_for_ANOVA$Treatment <- ordered(LZ_Y_df_for_ANOVA$Treatment, levels = c("DomP-LZ","MusP-LZ", "MSHyb-LZ", "DFHyb-LZ"))
+
+#perform ANOVA
+LZ_Y.aov <- aov(N_Genes ~ Treatment, data = LZ_Y_df_for_ANOVA)
+# Summary of the analysis
+summary(LZ_Y.aov)
+#Tukey's
+LZ_Y.tukey <- TukeyHSD(LZ_Y.aov)
+
+#letter dataframe for plotting
+LZ_Y.letters <- TukeyHSD(LZ_Y.aov, conf.level = 0.95)$Treatment[,4]
+names(LZ_Y.letters) <- gsub("-LZ", "_LZ", names(LZ_Y.letters))
+LZ_Y.letters <- data.frame(multcompView::multcompLetters(LZ_Y.letters)$Letters)
+rownames(LZ_Y.letters) <- gsub("_LZ", "-LZ", rownames(LZ_Y.letters))
+LZ_Y.letters$treatment=rownames(LZ_Y.letters)
+colnames(LZ_Y.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=LZ_Y_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-LZ","MusP-LZ", "MSHyb-LZ", "DFHyb-LZ"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(LZ_Y.letters, yvalue)
+
+LZ_Y_ANOVA_boxplot <- ggplot(LZ_Y_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number Y-Linked LZ Genes') +
+  geom_boxplot(fill = '#FFBA08', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for DIP comps
+DIP_Y_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_DIP_justY > rpkm.cutoff),
+           colSums(rpkm_MusP_DIP_justY > rpkm.cutoff),
+           colSums(rpkm_MSHyb_DIP_justY > rpkm.cutoff),
+           colSums(rpkm_DFHyb_DIP_justY > rpkm.cutoff)))           
+DIP_Y_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(DIP_Y_df_for_ANOVA))
+colnames(DIP_Y_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+DIP_Y_df_for_ANOVA$Treatment <- ordered(DIP_Y_df_for_ANOVA$Treatment, levels = c("DomP-DIP","MusP-DIP", "MSHyb-DIP", "DFHyb-DIP"))
+
+#perform ANOVA
+DIP_Y.aov <- aov(N_Genes ~ Treatment, data = DIP_Y_df_for_ANOVA)
+# Summary of the analysis
+summary(DIP_Y.aov)
+#Tukey's
+DIP_Y.tukey <- TukeyHSD(DIP_Y.aov)
+
+#letter dataframe for plotting
+DIP_Y.letters <- TukeyHSD(DIP_Y.aov, conf.level = 0.95)$Treatment[,4]
+names(DIP_Y.letters) <- gsub("-DIP", "_DIP", names(DIP_Y.letters))
+DIP_Y.letters <- data.frame(multcompView::multcompLetters(DIP_Y.letters)$Letters)
+rownames(DIP_Y.letters) <- gsub("_DIP", "-DIP", rownames(DIP_Y.letters))
+DIP_Y.letters$treatment=rownames(DIP_Y.letters)
+colnames(DIP_Y.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=DIP_Y_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-DIP","MusP-DIP", "MSHyb-DIP", "DFHyb-DIP"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(DIP_Y.letters, yvalue)
+
+DIP_Y_ANOVA_boxplot <- ggplot(DIP_Y_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number Y-Linked DIP Genes') +
+  geom_boxplot(fill = '#99C665', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+
+#set up dataframes for RS comps
+RS_Y_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_RS_justY > rpkm.cutoff),
+           colSums(rpkm_MusP_RS_justY > rpkm.cutoff),
+           colSums(rpkm_MSHyb_RS_justY > rpkm.cutoff),
+           colSums(rpkm_DFHyb_RS_justY > rpkm.cutoff)))           
+RS_Y_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(RS_Y_df_for_ANOVA))
+colnames(RS_Y_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+RS_Y_df_for_ANOVA$Treatment <- ordered(RS_Y_df_for_ANOVA$Treatment, levels = c("DomP-RS","MusP-RS", "MSHyb-RS", "DFHyb-RS"))
+
+#perform ANOVA
+RS_Y.aov <- aov(N_Genes ~ Treatment, data = RS_Y_df_for_ANOVA)
+# Summary of the analysis
+summary(RS_Y.aov)
+#Tukey's
+RS_Y.tukey <- TukeyHSD(RS_Y.aov)
+
+#letter dataframe for plotting
+RS_Y.letters <- TukeyHSD(RS_Y.aov, conf.level = 0.95)$Treatment[,4]
+names(RS_Y.letters) <- gsub("-RS", "_RS", names(RS_Y.letters))
+RS_Y.letters <- data.frame(multcompView::multcompLetters(RS_Y.letters)$Letters)
+rownames(RS_Y.letters) <- gsub("_RS", "-RS", rownames(RS_Y.letters))
+RS_Y.letters$treatment=rownames(RS_Y.letters)
+colnames(RS_Y.letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=RS_Y_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-RS","MusP-RS", "MSHyb-RS", "DFHyb-RS"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(RS_Y.letters, yvalue)
+
+RS_Y_ANOVA_boxplot <- ggplot(RS_Y_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number Y-Linked RS Genes') +
+  geom_boxplot(fill = '#354377', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+
+
+#set up dataframes for WT comps
+WT_Y_df_for_ANOVA <- as.data.frame(c(colSums(rpkm_DomP_WT_justY > rpkm.cutoff),
+           colSums(rpkm_MusP_WT_justY > rpkm.cutoff),
+           colSums(rpkm_MSHyb_WT_justY > rpkm.cutoff),
+           colSums(rpkm_DFHyb_WT_justY > rpkm.cutoff)))           
+WT_Y_df_for_ANOVA$trt <- gsub("([A-z]*).*[0-9]-([A-z]*)", "\\1-\\2", rownames(WT_Y_df_for_ANOVA))
+colnames(WT_Y_df_for_ANOVA) <- c("N_Genes", "Treatment")          
+WT_Y_df_for_ANOVA$Treatment <- ordered(WT_Y_df_for_ANOVA$Treatment, levels = c("DomP-WT","MusP-WT", "MSHyb-WT", "DFHyb-WT"))
+
+#perform ANOVA
+WT_Y.aov <- aov(N_Genes ~ Treatment, data = WT_Y_df_for_ANOVA)
+# Summary of the analysis
+summary(WT_Y.aov)
+#Tukey's
+WT_Y.tukey <- TukeyHSD(WT_Y.aov)
+
+#letter dataframe for plotting
+WT_Y.Letters <- TukeyHSD(WT_Y.aov, conf.level = 0.95)$Treatment[,4]
+names(WT_Y.Letters) <- gsub("-WT", "_WT", names(WT_Y.Letters))
+WT_Y.Letters <- data.frame(multcompView::multcompLetters(WT_Y.Letters)$Letters)
+rownames(WT_Y.Letters) <- gsub("_WT", "-WT", rownames(WT_Y.Letters))
+WT_Y.Letters$treatment=rownames(WT_Y.Letters)
+colnames(WT_Y.Letters) <- c("Letters", "Treatment")
+yvalue <- aggregate(.~Treatment, data=WT_Y_df_for_ANOVA, mean)
+yvalue$N_Genes <- yvalue$N_Genes + 10
+yvalue$Treatment <- ordered(yvalue$Treatment, levels = c("DomP-WT","MusP-WT", "MSHyb-WT", "DFHyb-WT"))
+yvalue <- yvalue[order(yvalue$Treatment) , ]
+final <- merge(WT_Y.Letters, yvalue)
+
+WT_Y_ANOVA_boxplot <- ggplot(WT_Y_df_for_ANOVA, aes(x = Treatment, y = N_Genes)) +
+  geom_blank() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  labs(x = 'Cross', y = 'Number Y-Linked WT Genes') +
+  geom_boxplot(fill = '#874F73', stat = "boxplot") +
+  geom_text(data = final, aes(x = Treatment, y = N_Genes, label = Letters),vjust=-3.5,hjust=-.5) + 
+  scale_x_discrete(labels = c("dom", "mus", "sterile", "fertile")) +
+  ylim(min(final$N_Genes)-80, max(final$N_Genes)+80)
+
+SP_Y_ANOVA_boxplot
+LZ_Y_ANOVA_boxplot
+DIP_Y_ANOVA_boxplot
+RS_Y_ANOVA_boxplot
+WT_Y_ANOVA_boxplot
+
+ggsave("exported_figures/DIP_Y_ANOVA_boxplot.pdf", DIP_Y_ANOVA_boxplot)
+ggsave("exported_figures/RS_Y_ANOVA_boxplot.pdf", RS_Y_ANOVA_boxplot)
+ggsave("exported_figures/WT_Y_ANOVA_boxplot.pdf", WT_Y_ANOVA_boxplot)
+
+```
+
+<h1>Cell Purity of sorted cells and whole testes</h1>
+``` {r message=FALSE}
+#import marker genes from Green et al. 2018
+marker.genes <- read.table("green_2018_marker_genes.csv", header = TRUE, stringsAsFactors = FALSE, sep = ",")
+colnames(marker.genes) <- c("gene.list", "p_val", "avg_diff", "pct.1", "pct.2", "CellType", "Exp", "Exp.")
+marker.genes$gene.des <- paste(marker.genes$gene.list, marker.genes$CellType, sep = ":")
+
+#gene.data <- rbind(gene.data, marker.genes[c(1,9)])
+gene.data <- marker.genes[c(1,6)]
+marker_facet_df <- data.frame()
+
+par(mfrow = c(2, 2), oma = c(0, 0, 0, 0))
+for (gene in 1:nrow(gene.data)) {
+  focal <- row.names(annotations[annotations$gene == gene.data[gene, 1], ])
+  
+  rpkm_matrix <- as.data.frame(rbind(
+    as.numeric(rpkm_Full_MusP_SP[focal, ]),
+    as.numeric(rpkm_Full_MusP_LZ[focal, ]),
+    as.numeric(rpkm_Full_MusP_DIP[focal, ]),
+    as.numeric(rpkm_Full_MusP_RS[focal, ]),
+    as.numeric(rpkm_Full_MusP_WT[focal, ]),
+    as.numeric(rpkm_Full_DomP_SP[focal, ]),
+    as.numeric(rpkm_Full_DomP_LZ[focal, ]),
+    as.numeric(rpkm_Full_DomP_DIP[focal, ]),
+    as.numeric(rpkm_Full_DomP_RS[focal, ]),
+    as.numeric(rpkm_Full_DomP_WT[focal, ])))
+  
+  rpkm_matrix[4] <- c("MusP_SP","MusP_LZ","MusP_DIP","MusP_RS","MusP_WT",
+                      "DomP_SP","DomP_LZ","DomP_DIP","DomP_RS","DomP_WT")
+  rpkm_matrix <- rpkm_matrix[c(4,1,2,3)]
+  
+  
+  melted_rpkm_matrix <- rpkm_matrix %>% gather(ID, RPKM, V1:V3)
+  melted_rpkm_matrix$value <- as.numeric(melted_rpkm_matrix$RPKM)
+  #  melted_rpkm_matrix$V4 <- as.factor(melted_rpkm_matrix$V4)
+  melted_rpkm_matrix$V4 <- factor(melted_rpkm_matrix$V4, levels = c("MusP_SP", "MusP_LZ", "MusP_DIP", "MusP_RS", "MusP_WT", "DomP_SP", "DomP_LZ", "DomP_DIP", "DomP_RS", "DomP_WT"))
+  melted_rpkm_matrix$gene <- rep(gene.data[gene, 1], 30)
+  melted_rpkm_matrix$stage <- as.factor(gene.data[gene, 2])
+  marker_facet_df <- rbind(marker_facet_df, melted_rpkm_matrix)
+  
+  #change exportFigs to TRUE to export as SVG if desired
+  if(exportFigs == TRUE) {
+    marker_alone_plot <- ggplot(melted_rpkm_matrix, aes(x = V4, y = RPKM, color = V4)) +
+      geom_boxplot(outlier.colour = "black",outlier.shape = 16,outlier.size = 2,notch = FALSE) +
+      theme_classic() +
+      scale_color_manual(
+        values = c("#D14949","#FFBA08","#99C665","#354377","#874F73","#D14949","#FFBA08","#99C665","#354377","#874F73")) +
+      theme(axis.title.x = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            axis.title.y = element_blank(),
+            legend.position = "none",
+            plot.title = element_text(hjust = 0.5)) +
+      ggtitle(gene.data[gene, 1])
+    print(marker_alone_plot)
+    
+    #fname <- paste("exported_figures/purity-test_", paste(gene.data[gene, 1], gene.data[gene,2], sep = "_"), ".svg", sep = "")
+    #ggsave(filename = fname, plot = marker_alone_plot)
+  }
+}
+
+marker_facet_df$gene <- factor(marker_facet_df$gene, levels = c("Dmrt1", "Ccnb3", "Cabyr", "Car2", "Pcp4l1", "Cst9", "Cyp17a1", "Hells", "Gmcl1", "Acrv1", "Tnp1", "Abcb1a", "Clu", "Ptgds", "Ncl", "Pabpc6", "Fam209", "Prm1", "Ly6c1", "Defb19", "Insl3"))
+
+
+mus_markers <- ggplot(data = marker_facet_df[grep("MusP", marker_facet_df$V4),], aes(x = V4, y = RPKM, fill = V4)) +
+  geom_boxplot(outlier.colour = "black",outlier.shape = 16,outlier.size = 2,notch = FALSE, size = 0.2) + 
+  stat_boxplot(geom ='errorbar', size = 0.2) +
+  facet_wrap(vars(gene), ncol = 7, scales = "free") +
+  theme_classic() + 
+  scale_fill_manual(
+    values = c("#D14949","#FFBA08","#99C665","#354377","#874F73","#D14949","#FFBA08","#99C665","#354377","#874F73")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.line = element_blank(),
+        panel.spacing.x=unit(0.01, "lines"),panel.spacing.y=unit(0, "lines"),
+        axis.text=element_text(size=5),
+        strip.text = element_text(face = "italic", size = 8),
+        strip.background = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        legend.position = "none")  +
+  ylab("FPKM")
+
+dom_markers <- ggplot(data = marker_facet_df[grep("DomP", marker_facet_df$V4),], aes(x = V4, y = RPKM, fill = V4)) +
+  geom_boxplot(outlier.colour = "black",outlier.shape = 16,outlier.size = 2,notch = FALSE, size = 0.2) + 
+  stat_boxplot(geom ='errorbar', size = 0.2) +
+  facet_wrap(vars(gene), ncol = 7, scales = "free") +
+  theme_classic() +
+  scale_fill_manual(
+    values = c("#D14949","#FFBA08","#99C665","#354377","#874F73","#D14949","#FFBA08","#99C665","#354377","#874F73")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text=element_text(size=5),
+        axis.line = element_blank(),
+        panel.spacing.x=unit(0.01, "lines"),panel.spacing.y=unit(0, "lines"),
+        strip.text = element_text(face = "italic", size = 8),
+        strip.background = element_blank(),
+        panel.border = element_rect(linetype = "solid", fill = NA),
+        legend.position = "none")  +
+  ylab("FPKM")
+
+mus_markers
+dom_markers
+
+    #change exportFigs to TRUE to export as SVG if desired
+    if(exportFigs == TRUE) {
+    ggsave(filename = "exported_figures/mus_purity_markers.svg", plot = mus_markers, width = 6.5, height = 3.5)
+    ggsave(filename = "exported_figures/dom_purity_markers.svg", plot = dom_markers, width = 6.5, height = 3.5)
+    }
+```
+
+<h1>Analysis of transcription levels</h1>
+<h3>Whole Genome Transcription</h3>
+```{r}
+
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file = "exported_figures/beanplot_All_exp.pdf", width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(2, 3), oma=c(0,0,0,0))
+#874F73, #F0E5EC, #C398B4
+beanplot(rpkm.norm.bycell[, "MusP_WT"], 
+         rpkm.norm.bycell[, "DomP_WT"], 
+         rpkm.norm.bycell[, "MSHyb_WT"], 
+         rpkm.norm.bycell[, "DFHyb_WT"], 
+         col = c("#C398B4", "#F0E5EC", "#874F73"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: WT", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+#D14949, #FBEFEF, #EBADAD
+beanplot(rpkm.norm.bycell[, "MusP_SP"], 
+         rpkm.norm.bycell[, "DomP_SP"], 
+         rpkm.norm.bycell[, "MSHyb_SP"], 
+         rpkm.norm.bycell[, "DFHyb_SP"], 
+         col = c("#EBADAD", "#FBEFEF", "#D14949"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: SP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#FFBA08, #FFF3D6, #FFDC85
+beanplot(rpkm.norm.bycell[, "MusP_LZ"], 
+         rpkm.norm.bycell[, "DomP_LZ"], 
+         rpkm.norm.bycell[, "MSHyb_LZ"], 
+         rpkm.norm.bycell[, "DFHyb_LZ"], 
+         col = c("#FFDC85", "#FFF3D6", "#FFBA08"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: LZ", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#99C665, #EBF3E2, #7EB342
+beanplot(rpkm.norm.bycell[, "MusP_DIP"], 
+         rpkm.norm.bycell[, "DomP_DIP"], 
+         rpkm.norm.bycell[, "MSHyb_DIP"], 
+         rpkm.norm.bycell[, "DFHyb_DIP"], 
+         col = c("#7EB342", "#EBF3E2", "#99C665"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: DIP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#354377, #E2E7F3, #7283C0
+beanplot(rpkm.norm.bycell[, "MusP_RS"], 
+         rpkm.norm.bycell[, "DomP_RS"], 
+         rpkm.norm.bycell[, "MSHyb_RS"], 
+         rpkm.norm.bycell[, "DFHyb_RS"], 
+         col = c("#7283C0", "#E2E7F3", "#354377"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: RS", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+```
+
+<h3>X Chromosome Transcription</h3>
+```{r}
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file = "exported_figures/beanplot_X_exp.pdf", width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(2, 3), oma=c(0,0,0,0))
+#874F73, #F0E5EC, #C398B4
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MusP_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DomP_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MSHyb_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DFHyb_WT"], 
+         col = c("#C398B4", "#F0E5EC", "#874F73"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: WT", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+#D14949, #FBEFEF, #EBADAD
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MusP_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DomP_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MSHyb_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DFHyb_SP"], 
+         col = c("#EBADAD", "#FBEFEF", "#D14949"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: SP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#FFBA08, #FFF3D6, #FFDC85
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MusP_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DomP_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MSHyb_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DFHyb_LZ"], 
+         col = c("#FFDC85", "#FFF3D6", "#FFBA08"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: LZ", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#99C665, #EBF3E2, #7EB342
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MusP_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DomP_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MSHyb_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DFHyb_DIP"], 
+         col = c("#7EB342", "#EBF3E2", "#99C665"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: DIP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#354377, #E2E7F3, #7283C0
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MusP_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DomP_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "MSHyb_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "X", "DFHyb_RS"], 
+         col = c("#7283C0", "#E2E7F3", "#354377"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "X chromosome: RS", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+```
+
+<h3>Y Chromosome Transcription</h3>
+```{r}
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file = "exported_figures/beanplot_Y_exp.pdf", width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(2, 3), oma=c(0,0,0,0))
+#874F73, #F0E5EC, #C398B4
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MusP_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DomP_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MSHyb_WT"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DFHyb_WT"], 
+         col = c("#C398B4", "#F0E5EC", "#874F73"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "Y chromosome: WT", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+#D14949, #FBEFEF, #EBADAD
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MusP_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DomP_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MSHyb_SP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DFHyb_SP"], 
+         col = c("#EBADAD", "#FBEFEF", "#D14949"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "Y chromosome: SP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#FFBA08, #FFF3D6, #FFDC85
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MusP_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DomP_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MSHyb_LZ"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DFHyb_LZ"], 
+         col = c("#FFDC85", "#FFF3D6", "#FFBA08"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "Y chromosome: LZ", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#99C665, #EBF3E2, #7EB342
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MusP_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DomP_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MSHyb_DIP"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DFHyb_DIP"], 
+         col = c("#7EB342", "#EBF3E2", "#99C665"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "Y chromosome: DIP", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+         
+#354377, #E2E7F3, #7283C0
+beanplot(rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MusP_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DomP_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "MSHyb_RS"], 
+         rpkm.norm.bycell[rpkm.norm.bycell$chr == "Y", "DFHyb_RS"], 
+         col = c("#7283C0", "#E2E7F3", "#354377"), border = c("#bdbdbd"), names = c("mus", "dom", "sterile", "fertile"), 
+         ylab = "FPKM (transformed)", bty = "n", 
+         main = "Y chromosome: RS", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+```
+
+<h3>Expression of induced genes in WT dataset</h3>
+```{r  message=FALSE}
+exportFigs <- TRUE
+
+#sterile hybrids have proportionally more SP/LZ and fewer DIP/RS so genes induced in SP/LZ should be over-expressed in sterile v. fertile hybrid WTs and DIP/RS genes should be under-expressed in sterile v. fertile hybrids
+#we find this pattern for all genes in the genome but the disruption of MSCI/PSCR masks this pattern for X-linked genes
+induced.cutoff <- 2
+high.cutoff <- 4
+dir.create("./induced")
+
+SP.induced <- rownames(rpkm.bycell[rownames(rpkm.bycell) %in% MusP.DomP.SP.exp
+                                   & rowMedians(as.matrix(rpkm.bycell[,c("MusP_SP","DomP_SP")])) >
+                                     rowMedians(as.matrix(rpkm.bycell[,c("MusP_LZ","MusP_DIP","MusP_RS","DomP_LZ","DomP_DIP","DomP_RS")]))*induced.cutoff, ])
+SP_Auto.induced <- SP.induced[!(SP.induced %in% rownames(X_genes)) & !(SP.induced %in% rownames(Y_genes))]
+SP_X.induced <- SP.induced[SP.induced %in% rownames(X_genes)]
+write.table(SP.induced, file = "./induced/SP.induced.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(SP_X.induced, file = "./induced/SP.induced.X.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+LZ.induced <- rownames(rpkm.bycell[rownames(rpkm.bycell) %in% MusP.DomP.LZ.exp
+                                   & rowMedians(as.matrix(rpkm.bycell[,c("MusP_LZ","DomP_LZ")])) >
+                                     rowMedians(as.matrix(rpkm.bycell[,c("MusP_SP","MusP_DIP","MusP_RS","DomP_SP","DomP_DIP","DomP_RS")]))*induced.cutoff, ])
+LZ_Auto.induced <- LZ.induced[!(LZ.induced %in% rownames(X_genes)) & !(LZ.induced %in% rownames(Y_genes))]
+LZ_X.induced <- LZ.induced[LZ.induced %in% rownames(X_genes)]
+write.table(LZ.induced, file = "./induced/LZ.induced.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(LZ_X.induced, file = "./induced/LZ.induced.X.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+DIP.induced <- rownames(rpkm.bycell[rownames(rpkm.bycell) %in% MusP.DomP.DIP.exp
+                                    & rowMedians(as.matrix(rpkm.bycell[,c("MusP_DIP","DomP_DIP")])) >
+                                      rowMedians(as.matrix(rpkm.bycell[,c("MusP_SP","MusP_LZ","MusP_RS","DomP_SP","DomP_LZ","DomP_RS")]))*induced.cutoff, ])
+DIP_Auto.induced <- DIP.induced[!(DIP.induced %in% rownames(X_genes)) & !(DIP.induced %in% rownames(Y_genes))]
+DIP_X.induced <- DIP.induced[DIP.induced %in% rownames(X_genes)]
+write.table(DIP.induced, file = "./induced/DIP.induced.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(DIP_X.induced, file = "./induced/DIP.induced.X.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+RS.induced <- rownames(rpkm.bycell[rownames(rpkm.bycell) %in% MusP.DomP.RS.exp
+                                   & rowMedians(as.matrix(rpkm.bycell[,c("MusP_RS","DomP_RS")])) >
+                                     rowMedians(as.matrix(rpkm.bycell[,c("MusP_SP","MusP_LZ","MusP_DIP","DomP_SP","DomP_LZ","DomP_DIP")]))*induced.cutoff, ]) 
+RS_Auto.induced <- RS.induced[!(RS.induced %in% rownames(X_genes)) & !(RS.induced %in% rownames(Y_genes))]
+RS_X.induced <- RS.induced[RS.induced %in% rownames(X_genes)]
+write.table(RS.induced, file = "./induced/RS.induced.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(RS_X.induced, file = "./induced/RS.induced.X.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+WT.induced <- rownames(rpkm.bycell[rownames(rpkm.bycell) %in% MusP.DomP.WT.exp
+                                   & rowMedians(as.matrix(rpkm.bycell[,c("MusP_WT","DomP_WT")])) >
+                                     rowMedians(as.matrix(rpkm.bycell[,c("MusP_SP","MusP_LZ","MusP_DIP", "MusP_RS", "DomP_SP","DomP_LZ","DomP_DIP", "DomP_RS")]))*induced.cutoff, ]) 
+WT_Auto.induced <- WT.induced[!(WT.induced %in% rownames(X_genes)) & !(WT.induced %in% rownames(Y_genes))]
+WT_X.induced <- WT.induced[WT.induced %in% rownames(X_genes)]
+write.table(WT.induced, file = "./induced/WT.induced.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+write.table(WT_X.induced, file = "./induced/WT.induced.X.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+WT.only <- !(WT.induced %in% unique(c(SP.induced, LZ.induced, DIP.induced, RS.induced)))
+length(WT.only)
+length(intersect(WT.induced, RS.induced))
+length(setdiff(WT.induced, RS.induced))
+length(setdiff(RS.induced, WT.induced))
+length(RS.induced)
+length(WT.induced)
+
+#whole genome significance testing
+sp_auto_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% SP_Auto.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% SP_Auto.induced, "DFHyb_WT"], alternative = "greater", paired = TRUE)$p.value
+lz_auto_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% LZ_Auto.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% LZ_Auto.induced, "DFHyb_WT"], alternative = "greater", paired = TRUE)$p.value
+dip_auto_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% DIP_Auto.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% DIP_Auto.induced, "DFHyb_WT"], alternative = "less", paired = TRUE)$p.value
+rs_auto_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% RS_Auto.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% RS_Auto.induced, "DFHyb_WT"], alternative = "less", paired = TRUE)$p.value
+
+#X chromosome significance testing
+sp_x_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% SP_X.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% SP_X.induced, "DFHyb_WT"], alternative = "two.sided", paired = TRUE)$p.value
+lz_x_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% LZ_X.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% LZ_X.induced, "DFHyb_WT"], alternative = "two.sided", paired = TRUE)$p.value
+dip_x_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% DIP_X.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% DIP_X.induced, "DFHyb_WT"], alternative = "two.sided", paired = TRUE)$p.value
+rs_x_p_induced <- wilcox.test(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% RS_X.induced, "MSHyb_WT"], rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% RS_X.induced, "DFHyb_WT"], alternative = "two.sided", paired = TRUE)$p.value
+
+induced_p_values <- c(sp_auto_p_induced, lz_auto_p_induced, dip_auto_p_induced, rs_auto_p_induced, sp_x_p_induced, lz_x_p_induced, dip_x_p_induced, rs_x_p_induced)
+
+induced_p_values_adjusted <- round(p.adjust(induced_p_values, method = "fdr"), digits = 3)
+
+bean_colors <- data.frame(SP =  c("#EBADAD", "#FBEFEF", "#D14949"),
+                          LZ =  c("#FFDC85", "#FFF3D6", "#FFBA08"),
+                          DIP = c("#7EB342", "#EBF3E2", "#99C665"),
+                          RS =  c("#7283C0", "#E2E7F3", "#354377"))
+
+
+#showing induced is actually induced in MusP parent
+      #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/MusP_induced_beanplots_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  print(stages[iter])  
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MusP_SP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MusP_LZ"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MusP_DIP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MusP_RS"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MusP_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("SP", "LZ", "DIP", "RS", "WT"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," Genes in MusP", sep = ""), log = "", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+}
+      #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+#showing induced is actually induced in MusP parent X chromosome; not enough DIP genes so need to remove for this to work
+
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/MusP_induced_beanplots_X_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  print(stages[iter])  
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MusP_SP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MusP_LZ"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MusP_DIP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MusP_RS"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MusP_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("SP", "LZ", "DIP", "RS", "WT"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," X Genes in MusP", sep = ""), log = "",ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+}
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+#showing induced is actually induced in DomP parent
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/DomP_induced_beanplots_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  print(stages[iter])  
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DomP_SP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DomP_LZ"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DomP_DIP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DomP_RS"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DomP_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("SP", "LZ", "DIP", "RS", "WT"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," Genes in DomP", sep = ""), log = "", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+}
+
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+#showing induced is actually induced in DomP parent X chromosome
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/DomP_induced_beanplots_X_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  print(stages[iter])  
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DomP_SP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DomP_LZ"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DomP_DIP"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DomP_RS"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DomP_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("SP", "LZ", "DIP", "RS", "WT"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," X Genes in DomP", sep = ""), log = "", ylim = c(0, 0.6), maxwidth = 0.25, ll = 0.25)
+}
+
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+
+#hybrids
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/Hybrid_induced_beanplots_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "MSHyb_WT"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_Auto.induced", sep = "")), "DFHyb_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("Sterile", "Fertile"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," Genes in WT Hybrids", sep = ""), log = "", ylim = c(0, 0.45), maxwidth = 0.25, ll = 0.25)
+}
+
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+
+#hybrids X chromosome
+    if(exportFigs == TRUE) {
+      pdf(file = paste("exported_figures/Hybrid_induced_beanplots_X_", induced.cutoff, "_cut-off", ".pdf", sep = ""), width=10, height=8, pointsize=12)
+    }
+
+par(mfrow = c(1, 4))
+
+for(iter in 1:(length(stages)-1)){
+  beanplot(rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "MSHyb_WT"], 
+           rpkm.norm.bycell[rownames(rpkm.norm.bycell) %in% get(paste(stages[iter],"_X.induced", sep = "")), "DFHyb_WT"], 
+           col = as.character(bean_colors[,iter]), border = c("#bdbdbd"), names = c("Sterile", "Fertile"), 
+           ylab = "FPKM (transformed)", bty = "n", 
+           main = paste(stages[iter]," X Genes in WT Hybrids", sep = ""), log = "", ylim = c(0, 0.45), maxwidth = 0.25, ll = 0.25)
+}
+
+    if(exportFigs == TRUE) {
+      dev.off()
+    }
+```
+
+<h1>Differential Expression</h1>
+<h3>Design set-up</h3>
+```{r}
+design <- cbind(rownames(metadata), metadata[c(grep("cross",colnames(metadata)),grep("stage",colnames(metadata)),grep("condition_name",colnames(metadata)))])
+design$condition_name <- factor(design$condition_name)
+colnames(design) <- c("sample_ID", "cross", "stage", "condition_name")
+design$condition_name <- gsub("-",".",design$condition_name)
+design$condition_name <- as.factor(design$condition_name)
+design
+
+designmatrix_Full  <-  model.matrix(~0+design$condition_name)
+colnames(designmatrix_Full)  <-  levels(design$condition_name)
+rownames(designmatrix_Full)  <-  design$sample_ID
+
+#just sorted cell data; gets rid of WTs rows first then WTs columns
+designmatrix_Dev <- designmatrix_Full[grep("WT", rownames(designmatrix_Full), invert = TRUE),]
+designmatrix_Dev <- designmatrix_Dev[,grep("WT", colnames(designmatrix_Dev), invert = TRUE)]
+
+#just whole testes data; keeps only WTs rows first then WTs columns
+designmatrix_WT <- designmatrix_Full[grep("WT", rownames(designmatrix_Full), invert = FALSE),]
+designmatrix_WT <- designmatrix_WT[,grep("WT", colnames(designmatrix_WT), invert = FALSE)]
+```
+
+<h3>Defining contrasts</h3>
+```{r}
+contrast.list_Full <- makeContrasts(
+  # compare cell types between hybrids
+  Hyb.SP  =  MSHyb.SP - DFHyb.SP,  
+  Hyb.LZ  =  MSHyb.LZ - DFHyb.LZ, 
+  Hyb.DIP  =  MSHyb.DIP - DFHyb.DIP, 
+  Hyb.RS  =  MSHyb.RS - DFHyb.RS, 
+  Hyb.WT = MSHyb.WT - DFHyb.WT,
+  # parents
+  MusP.DomP.SP  =  MusP.SP - DomP.SP, 
+  MusP.DomP.LZ  =  MusP.LZ - DomP.LZ, 
+  MusP.DomP.DIP  =  MusP.DIP - DomP.DIP, 
+  MusP.DomP.RS  =  MusP.RS - DomP.RS,  
+  MusP.DomP.WT  =  MusP.WT - DomP.WT, 
+
+  levels  =  designmatrix_Full
+)
+contrast.list_Full
+
+
+contrast.list_Dev <- makeContrasts(
+  # compare cell types between hybrids
+  Hyb.SP  =  MSHyb.SP - DFHyb.SP,  
+  Hyb.LZ  =  MSHyb.LZ - DFHyb.LZ, 
+  Hyb.DIP  =  MSHyb.DIP - DFHyb.DIP, 
+  Hyb.RS  =  MSHyb.RS - DFHyb.RS, 
+  # parents
+  MusP.DomP.SP  =  MusP.SP - DomP.SP, 
+  MusP.DomP.LZ  =  MusP.LZ - DomP.LZ, 
+  MusP.DomP.DIP  =  MusP.DIP - DomP.DIP, 
+  MusP.DomP.RS  =  MusP.RS - DomP.RS,  
+
+  levels  =  designmatrix_Dev
+)
+contrast.list_Dev
+
+
+contrast.list_WT <- makeContrasts(
+  # compare cell types between hybrids
+  Hyb.WT = MSHyb.WT - DFHyb.WT,
+  # parents
+  MusP.DomP.WT  =  MusP.WT - DomP.WT, 
+
+  levels  =  designmatrix_WT
+)
+contrast.list_WT
+```
+
+<h3>Dispersion estimates of main datasets</h3>
+```{r}
+dgeFull <- estimateGLMCommonDisp(dgeFull, designmatrix_Full, verbose = TRUE)  # variation among samples (biological variation)
+dgeFull <- estimateGLMTrendedDisp(dgeFull, designmatrix_Full) 
+dgeFull <- estimateGLMTagwiseDisp(dgeFull, designmatrix_Full)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file="exported_figures/Dispersion_plots_Full_dataset.pdf", width=10, height=8, pointsize=12)
+plotBCV(dgeFull, main = paste("Full dataset (all genes); BCV = ",round(sqrt(dgeFull$common.dispersion), 3)), ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+    dev.off()
+    }
+plotBCV(dgeFull, main = paste("Dispersion estimates for full dataset; BCV = ",round(sqrt(dgeFull$common.dispersion), 3)), ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+
+dgeDev <- estimateGLMCommonDisp(dgeDev, designmatrix_Dev, verbose = TRUE)  # variation among samples (biological variation)
+dgeDev <- estimateGLMTrendedDisp(dgeDev, designmatrix_Dev) 
+dgeDev <- estimateGLMTagwiseDisp(dgeDev, designmatrix_Dev)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file="exported_figures/Dispersion_plots_Dev_dataset.pdf", width=10, height=8, pointsize=12)
+    plotBCV(dgeDev, main = paste("Sorted cell dataset (all genes); BCV = ",round(sqrt(dgeDev$common.dispersion), 3), sep = ""), ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-3, 13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+    dev.off()
+    }
+plotBCV(dgeDev, main = paste("Dispersion estimates for development dataset; BCV = ",round(sqrt(dgeDev$common.dispersion), 3)), ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+
+dgeWT <- estimateGLMCommonDisp(dgeWT, designmatrix_WT, verbose = TRUE)  # variation among samples (biological variation)
+dgeWT <- estimateGLMTrendedDisp(dgeWT, designmatrix_WT) 
+dgeWT <- estimateGLMTagwiseDisp(dgeWT, designmatrix_WT)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+    pdf(file="exported_figures/Dispersion_plots_WT_dataset.pdf", width=10, height=8, pointsize=12)
+    plotBCV(dgeWT, main = paste("Whole testes dataset (all genes); BCV = ",round(sqrt(dgeWT$common.dispersion), 3)) , ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+    dev.off()
+    }
+plotBCV(dgeWT, main = paste("Dispersion estimates for whole testes dataset; BCV = ",round(sqrt(dgeWT$common.dispersion), 3)), ylim = c(0, 12), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+```
+
+<h3>Additional dispersion estimates</h3>
+```{r}
+designmatrix_Dev_Hyb <- designmatrix_Dev[grep("Hyb", rownames(designmatrix_Dev), invert = FALSE),]
+designmatrix_Dev_Hyb <- designmatrix_Dev_Hyb[,grep("Hyb", colnames(designmatrix_Dev_Hyb))]
+
+dgeDev_Hyb <- estimateGLMCommonDisp(dgeDev_Hyb, designmatrix_Dev_Hyb, verbose = TRUE)  # variation among samples (biological variation)
+dgeDev_Hyb <- estimateGLMTrendedDisp(dgeDev_Hyb, designmatrix_Dev_Hyb) 
+dgeDev_Hyb <- estimateGLMTagwiseDisp(dgeDev_Hyb, designmatrix_Dev_Hyb)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file="exported_figures/Dispersion_plots_Dev_Hyb_dataset.pdf", width=10, height=8, pointsize=12)
+      plotBCV(dgeDev_Hyb, main = paste("Sorted cell hybrids (all genes); BCV = ",round(sqrt(dgeDev_Hyb$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+      dev.off()
+      }
+plotBCV(dgeDev_Hyb, main = paste("Dispersion estimates for dev hyb dataset; BCV = ",round(sqrt(dgeDev_Hyb$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+
+
+designmatrix_Dev_Par <- designmatrix_Dev[grep("P-", rownames(designmatrix_Dev), invert = FALSE),]
+designmatrix_Dev_Par <- designmatrix_Dev_Par[,grep("P.", colnames(designmatrix_Dev_Par))]
+
+dgeDev_Par <- estimateGLMCommonDisp(dgeDev_Par, designmatrix_Dev_Par, verbose = TRUE)  # variation among samples (biological variation)
+dgeDev_Par <- estimateGLMTrendedDisp(dgeDev_Par, designmatrix_Dev_Par) 
+dgeDev_Par <- estimateGLMTagwiseDisp(dgeDev_Par, designmatrix_Dev_Par)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file="exported_figures/Dispersion_plots_Dev_Par_dataset.pdf", width=10, height=8, pointsize=12)
+      plotBCV(dgeDev_Par, main = paste("Sorted cell parents (all genes); BCV = ",round(sqrt(dgeDev_Par$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+      dev.off()
+      }
+plotBCV(dgeDev_Par, main = paste("Dispersion estimates for dev parental dataset; BCV = ",round(sqrt(dgeDev_Par$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+
+designmatrix_WT_Hyb <- designmatrix_WT[grep("Hyb.*WT", rownames(designmatrix_WT), invert = FALSE),]
+designmatrix_WT_Hyb <- designmatrix_WT_Hyb[,grep("Hyb.*WT", colnames(designmatrix_WT_Hyb))]
+
+dgeWT_Hyb <- estimateGLMCommonDisp(dgeWT_Hyb, designmatrix_WT_Hyb, verbose = TRUE)  # variation among samples (biological variation)
+dgeWT_Hyb <- estimateGLMTrendedDisp(dgeWT_Hyb, designmatrix_WT_Hyb) 
+dgeWT_Hyb <- estimateGLMTagwiseDisp(dgeWT_Hyb, designmatrix_WT_Hyb)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file="exported_figures/Dispersion_plots_WT_Hyb_dataset.pdf", width=10, height=8, pointsize=12)
+      plotBCV(dgeWT_Hyb, main = paste("Whole testes hybrids (all genes); BCV = ",round(sqrt(dgeWT_Hyb$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+      dev.off()
+      }
+plotBCV(dgeWT_Hyb, main = paste("Dispersion estimates for wt hybrid dataset; BCV = ",round(sqrt(dgeWT_Hyb$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+
+designmatrix_WT_Par <- designmatrix_WT[grep("P.*WT", rownames(designmatrix_WT), invert = FALSE),]
+designmatrix_WT_Par <- designmatrix_WT_Par[,grep("P.*WT", colnames(designmatrix_WT_Par))]
+
+dgeWT_Par <- estimateGLMCommonDisp(dgeWT_Par, designmatrix_WT_Par, verbose = TRUE)  # variation among samples (biological variation)
+dgeWT_Par <- estimateGLMTrendedDisp(dgeWT_Par, designmatrix_WT_Par) 
+dgeWT_Par <- estimateGLMTagwiseDisp(dgeWT_Par, designmatrix_WT_Par)  # estimate genewise dispersion
+    #change exportFigs to TRUE to export as PDF if desired
+    if(exportFigs == TRUE) {
+      pdf(file="exported_figures/Dispersion_plots_WT_Par_dataset.pdf", width=10, height=8, pointsize=12)
+      plotBCV(dgeWT_Par, main = paste("Whole testes parents (all genes); BCV = ",round(sqrt(dgeWT_Par$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+      dev.off()
+      }
+plotBCV(dgeWT_Par, main = paste("Dispersion estimates for wt parental dataset; BCV = ",round(sqrt(dgeWT_Par$common.dispersion), 3)), ylim = c(0, 4), col.common = "#C2A5A2", col.trend = "#745756", xlab = "Average log(CPM)", xlim = c(-4,13), col = alpha("#6E6E6E", 0.15), cex = 1.25)
+```
+
+<h3>Fit model and calculate DE genes</h3>
+```{r}
+#glmFIT: Given the design matrix and dispersion estimates, fit a GLM to each feature. Perform a likelihood ratio test, specifying the difference of interest Use the topTags function to present a tabular summary of the differential expression statistics (note that topTags operates on the output of exactTest or glmLRT)
+contrasts_Full <- colnames(contrast.list_Full)
+for (f in 1:length(contrasts_Full)){
+  LRT <- glmLRT(glmFit(dgeFull,  designmatrix_Full), contrast = contrast.list_Full[, f])
+  assign(paste(contrasts_Full[f], "Full", "LRT", sep = "."), LRT)
+
+  tt <- topTags(LRT, n = nrow(LRT))
+  assign(paste(contrasts_Full[f], "Full", "tt", sep = "."), tt)
+  assign(paste(contrasts_Full[f], "Full", "de", sep = "."), rownames(tt$table[tt$table$FDR<= 0.05, ]))
+}
+rm(tt, LRT)
+
+
+contrasts_Dev <- colnames(contrast.list_Dev)
+for (f in 1:length(contrasts_Dev)){
+  LRT <- glmLRT(glmFit(dgeDev,  designmatrix_Dev), contrast = contrast.list_Dev[, f])
+  assign(paste(contrasts_Dev[f], "Dev", "LRT", sep = "."), LRT)
+
+  tt <- topTags(LRT, n = nrow(LRT))
+  assign(paste(contrasts_Dev[f], "Dev", "tt", sep = "."), tt)
+  assign(paste(contrasts_Dev[f], "Dev", "de", sep = "."), rownames(tt$table[tt$table$FDR<= 0.05, ]))
+}
+rm(tt, LRT)
+
+
+contrasts_WT <- colnames(contrast.list_WT)
+for (f in 1:length(contrasts_WT)){
+  LRT <- glmLRT(glmFit(dgeWT,  designmatrix_WT), contrast = contrast.list_WT[, f])
+  assign(paste(contrasts_WT[f], "WT", "LRT", sep = "."), LRT)
+
+  tt <- topTags(LRT, n = nrow(LRT))
+  assign(paste(contrasts_WT[f], "WT", "tt", sep = "."), tt)
+  assign(paste(contrasts_WT[f], "WT", "de", sep = "."), rownames(tt$table[tt$table$FDR<= 0.05, ]))
+}
+rm(tt, LRT)
+
+#larson writes tt out to a file; haven't done yet
+
+#reordering so the light colors are drawn later in processing
+setorder(Hyb.WT.WT.tt$table, -logFC)
+setorder(Hyb.SP.Dev.tt$table, -logFC)
+setorder(Hyb.LZ.Dev.tt$table, -logFC)
+setorder(Hyb.DIP.Dev.tt$table, -logFC)
+setorder(Hyb.RS.Dev.tt$table, -logFC)
+
+setorder(MusP.DomP.WT.WT.tt$table, -logFC)
+setorder(MusP.DomP.SP.Dev.tt$table, -logFC)
+setorder(MusP.DomP.LZ.Dev.tt$table, -logFC)
+setorder(MusP.DomP.DIP.Dev.tt$table, -logFC)
+setorder(MusP.DomP.RS.Dev.tt$table, -logFC)
+
+#hybrid outputs for processing
+write.csv(subset(Hyb.WT.WT.tt$table, Hyb.WT.WT.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/hybrid_WT.csv")
+write.csv(subset(Hyb.SP.Dev.tt$table, Hyb.SP.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/hybrid_SP.csv")
+write.csv(subset(Hyb.LZ.Dev.tt$table, Hyb.LZ.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/hybrid_LZ.csv")
+write.csv(subset(Hyb.DIP.Dev.tt$table, Hyb.DIP.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/hybrid_DIP.csv")
+write.csv(subset(Hyb.RS.Dev.tt$table, Hyb.RS.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/hybrid_RS.csv")
+
+#parent outputs for processing
+write.csv(subset(MusP.DomP.WT.WT.tt$table, MusP.DomP.WT.WT.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/parent_WT.csv")
+write.csv(subset(MusP.DomP.SP.Dev.tt$table, MusP.DomP.SP.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/parent_SP.csv")
+write.csv(subset(MusP.DomP.LZ.Dev.tt$table, MusP.DomP.LZ.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/parent_LZ.csv")
+write.csv(subset(MusP.DomP.DIP.Dev.tt$table, MusP.DomP.DIP.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/parent_DIP.csv")
+write.csv(subset(MusP.DomP.RS.Dev.tt$table, MusP.DomP.RS.Dev.tt$table$FDR<=0.05),"~/Dropbox/1_Denver/Research/Processing/sketches/sketch_5_layer_circos_dip/parent_RS.csv")
+```
+
+<h3>Define DE direction for switching gene calculation</h3>
+```{r}
+#defining up and down DE genes for sterile v fertile hybrids
+Hyb.WT.WT.up <- subset(Hyb.WT.WT.tt$table, Hyb.WT.WT.tt$table$FDR<=0.05 & Hyb.WT.WT.tt$table$logFC > 0)
+Hyb.WT.WT.down <- subset(Hyb.WT.WT.tt$table, Hyb.WT.WT.tt$table$FDR<=0.05 & Hyb.WT.WT.tt$table$logFC < 0)
+
+Hyb.WT.Full.up <- subset(Hyb.WT.Full.tt$table, Hyb.WT.Full.tt$table$FDR<=0.05 & Hyb.WT.Full.tt$table$logFC > 0)
+Hyb.WT.Full.down <- subset(Hyb.WT.Full.tt$table, Hyb.WT.Full.tt$table$FDR<=0.05 & Hyb.WT.Full.tt$table$logFC < 0)
+
+Hyb.SP.Dev.up <- subset(Hyb.SP.Dev.tt$table, Hyb.SP.Dev.tt$table$FDR<=0.05 & Hyb.SP.Dev.tt$table$logFC > 0)
+Hyb.SP.Dev.down <- subset(Hyb.SP.Dev.tt$table, Hyb.SP.Dev.tt$table$FDR<=0.05 & Hyb.SP.Dev.tt$table$logFC < 0)
+
+Hyb.SP.Full.up <- subset(Hyb.SP.Full.tt$table, Hyb.SP.Full.tt$table$FDR<=0.05 & Hyb.SP.Full.tt$table$logFC > 0)
+Hyb.SP.Full.down <- subset(Hyb.SP.Full.tt$table, Hyb.SP.Full.tt$table$FDR<=0.05 & Hyb.SP.Full.tt$table$logFC < 0)
+
+Hyb.LZ.Dev.up <- subset(Hyb.LZ.Dev.tt$table, Hyb.LZ.Dev.tt$table$FDR<=0.05 & Hyb.LZ.Dev.tt$table$logFC > 0)
+Hyb.LZ.Dev.down <- subset(Hyb.LZ.Dev.tt$table, Hyb.LZ.Dev.tt$table$FDR<=0.05 & Hyb.LZ.Dev.tt$table$logFC < 0)
+
+Hyb.LZ.Full.up <- subset(Hyb.LZ.Full.tt$table, Hyb.LZ.Full.tt$table$FDR<=0.05 & Hyb.LZ.Full.tt$table$logFC > 0)
+Hyb.LZ.Full.down <- subset(Hyb.LZ.Full.tt$table, Hyb.LZ.Full.tt$table$FDR<=0.05 & Hyb.LZ.Full.tt$table$logFC < 0)
+
+Hyb.DIP.Dev.up <- subset(Hyb.DIP.Dev.tt$table, Hyb.DIP.Dev.tt$table$FDR<=0.05 & Hyb.DIP.Dev.tt$table$logFC > 0)
+Hyb.DIP.Dev.down <- subset(Hyb.DIP.Dev.tt$table, Hyb.DIP.Dev.tt$table$FDR<=0.05 & Hyb.DIP.Dev.tt$table$logFC < 0)
+
+Hyb.DIP.Full.up <- subset(Hyb.DIP.Full.tt$table, Hyb.DIP.Full.tt$table$FDR<=0.05 & Hyb.DIP.Full.tt$table$logFC > 0)
+Hyb.DIP.Full.down <- subset(Hyb.DIP.Full.tt$table, Hyb.DIP.Full.tt$table$FDR<=0.05 & Hyb.DIP.Full.tt$table$logFC < 0)
+
+Hyb.RS.Dev.up <- subset(Hyb.RS.Dev.tt$table, Hyb.RS.Dev.tt$table$FDR<=0.05 & Hyb.RS.Dev.tt$table$logFC > 0)
+Hyb.RS.Dev.down <- subset(Hyb.RS.Dev.tt$table, Hyb.RS.Dev.tt$table$FDR<=0.05 & Hyb.RS.Dev.tt$table$logFC < 0)
+
+Hyb.RS.Full.up <- subset(Hyb.RS.Full.tt$table, Hyb.RS.Full.tt$table$FDR<=0.05 & Hyb.RS.Full.tt$table$logFC > 0)
+Hyb.RS.Full.down <- subset(Hyb.RS.Full.tt$table, Hyb.RS.Full.tt$table$FDR<=0.05 & Hyb.RS.Full.tt$table$logFC < 0)
+
+#defining up and down DE genes between parents
+MusP.DomP.WT.WT.up <- subset(MusP.DomP.WT.WT.tt$table, MusP.DomP.WT.WT.tt$table$FDR<=0.05 & MusP.DomP.WT.WT.tt$table$logFC > 0)
+MusP.DomP.WT.WT.down <- subset(MusP.DomP.WT.WT.tt$table, MusP.DomP.WT.WT.tt$table$FDR<=0.05 & MusP.DomP.WT.WT.tt$table$logFC < 0)
+
+MusP.DomP.WT.Full.up <- subset(MusP.DomP.WT.Full.tt$table, MusP.DomP.WT.Full.tt$table$FDR<=0.05 & MusP.DomP.WT.Full.tt$table$logFC > 0)
+MusP.DomP.WT.Full.down <- subset(MusP.DomP.WT.Full.tt$table, MusP.DomP.WT.Full.tt$table$FDR<=0.05 & MusP.DomP.WT.Full.tt$table$logFC < 0)
+
+MusP.DomP.SP.Dev.up <- subset(MusP.DomP.SP.Dev.tt$table, MusP.DomP.SP.Dev.tt$table$FDR<=0.05 & MusP.DomP.SP.Dev.tt$table$logFC > 0)
+MusP.DomP.SP.Dev.down <- subset(MusP.DomP.SP.Dev.tt$table, MusP.DomP.SP.Dev.tt$table$FDR<=0.05 & MusP.DomP.SP.Dev.tt$table$logFC < 0)
+
+MusP.DomP.SP.Full.up <- subset(MusP.DomP.SP.Full.tt$table, MusP.DomP.SP.Full.tt$table$FDR<=0.05 & MusP.DomP.SP.Full.tt$table$logFC > 0)
+MusP.DomP.SP.Full.down <- subset(MusP.DomP.SP.Full.tt$table, MusP.DomP.SP.Full.tt$table$FDR<=0.05 & MusP.DomP.SP.Full.tt$table$logFC < 0)
+
+MusP.DomP.LZ.Dev.up <- subset(MusP.DomP.LZ.Dev.tt$table, MusP.DomP.LZ.Dev.tt$table$FDR<=0.05 & MusP.DomP.LZ.Dev.tt$table$logFC > 0)
+MusP.DomP.LZ.Dev.down <- subset(MusP.DomP.LZ.Dev.tt$table, MusP.DomP.LZ.Dev.tt$table$FDR<=0.05 & MusP.DomP.LZ.Dev.tt$table$logFC < 0)
+
+MusP.DomP.LZ.Full.up <- subset(MusP.DomP.LZ.Full.tt$table, MusP.DomP.LZ.Full.tt$table$FDR<=0.05 & MusP.DomP.LZ.Full.tt$table$logFC > 0)
+MusP.DomP.LZ.Full.down <- subset(MusP.DomP.LZ.Full.tt$table, MusP.DomP.LZ.Full.tt$table$FDR<=0.05 & MusP.DomP.LZ.Full.tt$table$logFC < 0)
+
+MusP.DomP.DIP.Dev.up <- subset(MusP.DomP.DIP.Dev.tt$table, MusP.DomP.DIP.Dev.tt$table$FDR<=0.05 & MusP.DomP.DIP.Dev.tt$table$logFC > 0)
+MusP.DomP.DIP.Dev.down <- subset(MusP.DomP.DIP.Dev.tt$table, MusP.DomP.DIP.Dev.tt$table$FDR<=0.05 & MusP.DomP.DIP.Dev.tt$table$logFC < 0)
+
+MusP.DomP.DIP.Full.up <- subset(MusP.DomP.DIP.Full.tt$table, MusP.DomP.DIP.Full.tt$table$FDR<=0.05 & MusP.DomP.DIP.Full.tt$table$logFC > 0)
+MusP.DomP.DIP.Full.down <- subset(MusP.DomP.DIP.Full.tt$table, MusP.DomP.DIP.Full.tt$table$FDR<=0.05 & MusP.DomP.DIP.Full.tt$table$logFC < 0)
+
+MusP.DomP.RS.Dev.up <- subset(MusP.DomP.RS.Dev.tt$table, MusP.DomP.RS.Dev.tt$table$FDR<=0.05 & MusP.DomP.RS.Dev.tt$table$logFC > 0)
+MusP.DomP.RS.Dev.down <- subset(MusP.DomP.RS.Dev.tt$table, MusP.DomP.RS.Dev.tt$table$FDR<=0.05 & MusP.DomP.RS.Dev.tt$table$logFC < 0)
+
+MusP.DomP.RS.Full.up <- subset(MusP.DomP.RS.Full.tt$table, MusP.DomP.RS.Full.tt$table$FDR<=0.05 & MusP.DomP.RS.Full.tt$table$logFC > 0)
+MusP.DomP.RS.Full.down <- subset(MusP.DomP.RS.Full.tt$table, MusP.DomP.RS.Full.tt$table$FDR<=0.05 & MusP.DomP.RS.Full.tt$table$logFC < 0)
+```
+
+<h3>Count DE genes unique to each pairwise comparison and intersection</h3>
+```{r warning=FALSE}
+#set comparison graph; count intersection and unique DE genes between hybrid datasets
+cStages <- c("Hyb.WT.WT.tt", "Hyb.SP.Dev.tt", "Hyb.LZ.Dev.tt", "Hyb.DIP.Dev.tt", "Hyb.RS.Dev.tt")
+combos <- combn(cStages, 2)
+int <- vector()
+combo_names <- vector()
+set1 <- vector()
+set2 <- vector()
+s1_rho <- vector()
+s2_rho <- vector()
+s1_CI_1 <- vector()
+s1_CI_2 <- vector()
+s2_CI_1 <- vector()
+s2_CI_2 <- vector()
+
+for(combo in 1:ncol(combos)){
+  combo_names <- append(combo_names, (paste(str_match_all(combos[1, combo], "Hyb.([A-z]+).([A-z]+).tt")[[1]][,2], str_match_all(combos[2, combo], "Hyb.([A-z]+).([A-z]+).tt")[[1]][,2], sep = "_")), after = length(combo_names))
+  i <- length(intersect(get(combos[1, combo])$table[get(combos[1, combo])$table$FDR<= 0.05, ]$gene,     
+                        get(combos[2, combo])$table[get(combos[2, combo])$table$FDR<= 0.05, ]$gene))
+  s1 <- length(setdiff(get(combos[1, combo])$table[get(combos[1, combo])$table$FDR<= 0.05, ]$gene,     
+                         get(combos[2, combo])$table[get(combos[2, combo])$table$FDR<= 0.05, ]$gene))
+  s2 <- length(setdiff(get(combos[2, combo])$table[get(combos[2, combo])$table$FDR<= 0.05, ]$gene,     
+                         get(combos[1, combo])$table[get(combos[1, combo])$table$FDR<= 0.05, ]$gene))
+  
+  int <- append(int, i, after = length(int))
+  set1 <- append(set1, s1, after = length(set1))
+  set2 <- append(set2, s2, after = length(set2))
+  
+  s1_ids <- setdiff(rownames(get(combos[1, combo])$table[get(combos[1, combo])$table$FDR<= 0.05, ]),     
+                         rownames(get(combos[2, combo])$table[get(combos[2, combo])$table$FDR<= 0.05, ]))
+  s2_ids <- setdiff(rownames(get(combos[2, combo])$table[get(combos[2, combo])$table$FDR<= 0.05, ]),     
+                         rownames(get(combos[1, combo])$table[get(combos[1, combo])$table$FDR<= 0.05, ]))
+  
+  set1.FC_set1.DEs <- get(combos[1, combo])$table[s1_ids,]$logFC
+  set2.FC_set1.DEs <- get(combos[2, combo])$table[s1_ids,]$logFC
+  set1.FC_set2.DEs <- get(combos[1, combo])$table[s2_ids,]$logFC
+  set2.FC_set2.DEs <- get(combos[2, combo])$table[s2_ids,]$logFC
+  
+  set1.DEs_FC <- as.data.frame(cbind(set1.FC_set1.DEs, set2.FC_set1.DEs))
+  set2.DEs_FC <- as.data.frame(cbind(set1.FC_set2.DEs, set2.FC_set2.DEs))
+
+  set1.DEs_FC[is.na(set1.DEs_FC)] <- 0
+  set2.DEs_FC[is.na(set2.DEs_FC)] <- 0
+  
+  # print(paste(strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2], strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2], sep = "_"))
+  # print(cor.test(set1.DEs_FC$set1.FC_set1.DEs, set1.DEs_FC$set2.FC_set1.DEs, method = "spearman")$estimate)
+  # s1_rho <- append(s1_rho, cor.test(set1.DEs_FC$set1.FC_set1.DEs, set1.DEs_FC$set2.FC_set1.DEs, method = "spearman")$estimate, after = length(set1))
+  # 
+  # reps <- 1000
+  # set1.boot <- rep(NA, reps)
+  # for (i in 1:reps){
+  #   boot.data <- set1.DEs_FC[sample(rownames(set1.DEs_FC), dim(set1.DEs_FC)[1], replace = TRUE), ]
+  #   set1.test <- cor.test(boot.data$set1.FC_set1.DEs, boot.data$set2.FC_set1.DEs, method = "spearman")
+  #   set1.boot[i] <- set1.test$estimate
+  # }
+  # set1.ci <- quantile(set1.boot, probs = c(0.025, 0.975))
+  # print(paste("Set1 CIs: ", set1.ci[1], set1.ci[2], sep = " "))
+  # s1_CI_1 <- append(s1_CI_1, set1.ci[1], after = length(s1_CI_1))
+  # s1_CI_2 <- append(s1_CI_2, set1.ci[2], after = length(s1_CI_2))
+  # 
+  
+  # print(paste(strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2], strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2], sep = "_"))
+  # print(cor.test(set2.DEs_FC$set1.FC_set2.DEs, set2.DEs_FC$set2.FC_set2.DEs, method = "spearman")$estimate)
+  # s2_rho <- append(s2_rho, cor.test(set2.DEs_FC$set1.FC_set2.DEs, set2.DEs_FC$set2.FC_set2.DEs, method = "spearman")$estimate, after = length(set2))
+  
+  # print(cor.test(set1.DEs_FC$set1.FC_set1.DEs, set1.DEs_FC$set2.FC_set1.DEs, method = "spearman")$p.value)
+  # print(cor.test(set2.DEs_FC$set1.FC_set2.DEs, set2.DEs_FC$set2.FC_set2.DEs, method = "spearman")$p.value)
+  
+  # reps <- 1000
+  # set2.boot <- rep(NA, reps)
+  # for (i in 1:reps){
+  #   boot.data <- set2.DEs_FC[sample(rownames(set2.DEs_FC), dim(set2.DEs_FC)[1], replace = TRUE), ]
+  #   set2.test <- cor.test(boot.data$set1.FC_set2.DEs, boot.data$set2.FC_set2.DEs, method = "spearman")
+  #   set2.boot[i] <- set2.test$estimate
+  # }
+  # set2.ci <- quantile(set2.boot, probs = c(0.025, 0.975))
+  # print(paste("Set2 CIs: ", set2.ci[1], set2.ci[2], sep = " "))
+  # 
+  # s2_CI_1 <- append(s2_CI_1, set2.ci[1], after = length(s2_CI_1))
+  # s2_CI_2 <- append(s2_CI_2, set2.ci[2], after = length(s2_CI_2))
+  # 
+  # print(ggplot(set1.DEs_FC, aes(x=set1.FC_set1.DEs, y=set2.FC_set1.DEs)) +
+  #   geom_point(size=3) +
+  #   xlab(paste(strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2]," logFC", sep = "")) +
+  #   ylab(paste(strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2]," logFC", sep = "")) +
+  #   ggtitle(paste("logFC of ", 
+  #                 strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2],
+  #                 " DEs in ", 
+  #                 strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2], 
+  #                 " and in ", 
+  #                 strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2], 
+  #                 sep = "")) +
+  #   theme(plot.title = element_text(hjust = 0.5)))
+  # 
+  # print(ggplot(set2.DEs_FC, aes(x=set1.FC_set2.DEs, y=set2.FC_set2.DEs)) +
+  #   geom_point(size=3) +
+  #   xlab(paste(strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2]," logFC", sep = "")) +
+  #   ylab(paste(strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2]," logFC", sep = "")) +
+  #   ggtitle(paste("logFC of ", 
+  #                 strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2],
+  #                 " DEs in ", 
+  #                 strsplit(combos[1, combo], split = ".", fixed = TRUE)[[1]][2], 
+  #                 " and in ", 
+  #                 strsplit(combos[2, combo], split = ".", fixed = TRUE)[[1]][2], 
+  #                 sep = "")) +
+  #   theme(plot.title = element_text(hjust = 0.5)))
+}
+
+#set_diff_for_export <- data.frame(combo_names, int, set1, set2, s1_rho, s1_CI_1, s1_CI_2, s2_rho, s2_CI_1, s2_CI_2)
+set_diff_for_export <- data.frame(combo_names, int, set1, set2)
+rownames(set_diff_for_export) <- combo_names
+write.csv(set_diff_for_export, "~/Dropbox/1_Denver/Research/Processing/sketches/set_diff_viz/data/hybrid_set_counts.csv", row.names = FALSE)
+
+```
+
+<h3>Summarize DE Genes by Chromosome</h3>
+```{r}
+paste("#DE Genes in WT is", dim(subset(Hyb.WT.WT.tt$table, Hyb.WT.WT.tt$table$FDR<=0.05))[1], sep = " ")
+paste("#DE Genes in SP is", dim(subset(Hyb.SP.Dev.tt$table, Hyb.SP.Dev.tt$table$FDR<=0.05))[1], sep = " ")
+paste("#DE Genes in LZ is", dim(subset(Hyb.LZ.Dev.tt$table, Hyb.LZ.Dev.tt$table$FDR<=0.05))[1], sep = " ")
+paste("#DE Genes in DIP is", dim(subset(Hyb.DIP.Dev.tt$table, Hyb.DIP.Dev.tt$table$FDR<=0.05))[1], sep = " ")
+paste("#DE Genes in RS is", dim(subset(Hyb.RS.Dev.tt$table, Hyb.RS.Dev.tt$table$FDR<=0.05))[1], sep = " ")
+
+WT_x_DEs <- sum(Hyb.WT.WT.de %in% rownames(X_genes))
+WT_y_DEs <- sum(Hyb.WT.WT.de %in% rownames(Y_genes))
+WT_auto_DEs <- length(Hyb.WT.WT.de) - WT_x_DEs - WT_y_DEs
+WT_DE_counts <- c(WT_x_DEs, WT_y_DEs, WT_auto_DEs)
+
+SP_x_DEs <- sum(Hyb.SP.Dev.de %in% rownames(X_genes))
+SP_y_DEs <- sum(Hyb.SP.Dev.de %in% rownames(Y_genes))
+SP_auto_DEs <- length(Hyb.SP.Dev.de) - SP_x_DEs - SP_y_DEs
+SP_DE_counts <- c(SP_x_DEs, SP_y_DEs, SP_auto_DEs)
+
+LZ_x_DEs <- sum(Hyb.LZ.Dev.de %in% rownames(X_genes))
+LZ_y_DEs <- sum(Hyb.LZ.Dev.de %in% rownames(Y_genes))
+LZ_auto_DEs <- length(Hyb.LZ.Dev.de) - LZ_x_DEs - LZ_y_DEs
+LZ_DE_counts <- c(LZ_x_DEs, LZ_y_DEs, LZ_auto_DEs)
+
+DIP_x_DEs <- sum(Hyb.DIP.Dev.de %in% rownames(X_genes))
+DIP_y_DEs <- sum(Hyb.DIP.Dev.de %in% rownames(Y_genes))
+DIP_auto_DEs <- length(Hyb.DIP.Dev.de) - DIP_x_DEs - DIP_y_DEs
+DIP_DE_counts <- c(DIP_x_DEs, DIP_y_DEs, DIP_auto_DEs)
+
+RS_x_DEs <- sum(Hyb.RS.Dev.de %in% rownames(X_genes))
+RS_y_DEs <- sum(Hyb.RS.Dev.de %in% rownames(Y_genes))
+RS_auto_DEs <- length(Hyb.RS.Dev.de) - RS_x_DEs - RS_y_DEs
+RS_DE_counts <- c(RS_x_DEs, RS_y_DEs, RS_auto_DEs)
+
+#here
+
+DE_count_df <- rbind(SP_DE_counts, LZ_DE_counts, DIP_DE_counts, RS_DE_counts, WT_DE_counts)
+DE_count_df <- cbind(DE_count_df, rowSums(DE_count_df))
+DE_count_df <- cbind(DE_count_df, c(dim(Hyb.SP.Dev.up)[1], dim(Hyb.LZ.Dev.up)[1], dim(Hyb.DIP.Dev.up)[1], dim(Hyb.RS.Dev.up)[1], dim(Hyb.WT.WT.up)[1]))
+DE_count_df <- cbind(DE_count_df, c(dim(Hyb.SP.Dev.down)[1], dim(Hyb.LZ.Dev.down)[1], dim(Hyb.DIP.Dev.down)[1], dim(Hyb.RS.Dev.down)[1], dim(Hyb.WT.WT.down)[1]))
+
+colnames(DE_count_df) <- c("X-linked", "Y-linked", "Autosomal", "Total", "Up", "Down")
+
+
+
+kable(DE_count_df)
+
+```
+
+<h3>Do any genes switch direction of regulation between whole testes and sorted cells? (No in hybrids; yes in parents)</h3>
+```{r}
+#hybrid genes that switch between WT and stages (there are none)
+#WT up and SP down, then WT down and SP up, then WT up and SP up, then WT down and SP down
+sp_dir_hyb <- c(length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.SP.Dev.down))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.SP.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.SP.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.SP.Dev.down))))
+
+#WT up and LZ down, then WT down and LZ up, then WT up and LZ up, then WT down and LZ down
+lz_dir_hyb <- c(length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.LZ.Dev.down))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.LZ.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.LZ.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.LZ.Dev.down))))
+
+#WT up and DIP down, then WT down and DIP up, then WT up and DIP up, then WT down and DIP down
+dip_dir_hyb <- c(length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.DIP.Dev.down))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.DIP.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.DIP.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.DIP.Dev.down))))
+
+#WT up and RS down, then WT down and RS up, then WT up and RS up, then WT down and RS down
+rs_dir_hyb <- c(length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.RS.Dev.down))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.RS.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.up), rownames(Hyb.RS.Dev.up))),
+length(intersect(rownames(Hyb.WT.WT.down), rownames(Hyb.RS.Dev.down))))
+
+dir_hyb_df <- rbind(sp_dir_hyb, lz_dir_hyb, dip_dir_hyb, rs_dir_hyb)
+colnames(dir_hyb_df) <- c("up-down", "down-up", "up-up", "down-down")
+
+kable(dir_hyb_df)
+
+#parent genes that switch between WT and stages (there are none)
+#WT up and SP down, then WT down and SP up, then WT up and SP up, then WT down and SP down
+sp_dir_par <- c(length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.SP.Dev.down))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.SP.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.SP.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.SP.Dev.down))))
+
+#WT up and LZ down, then WT down and LZ up, then WT up and LZ up, then WT down and LZ down
+lz_dir_par <- c(length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.LZ.Dev.down))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.LZ.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.LZ.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.LZ.Dev.down))))
+
+#WT up and DIP down, then WT down and DIP up, then WT up and DIP up, then WT down and DIP down
+dip_dir_par <- c(length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.DIP.Dev.down))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.DIP.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.DIP.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.DIP.Dev.down))))
+
+#WT up and RS down, then WT down and RS up, then WT up and RS up, then WT down and RS down
+rs_dir_par <- c(length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.RS.Dev.down))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.RS.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.up), rownames(MusP.DomP.RS.Dev.up))),
+length(intersect(rownames(MusP.DomP.WT.WT.down), rownames(MusP.DomP.RS.Dev.down))))
+
+dir_par_df <- rbind(sp_dir_par, lz_dir_par, dip_dir_par, rs_dir_par)
+colnames(dir_par_df) <- c("up-down", "down-up", "up-up", "down-down")
+
+kable(dir_par_df)
+```
+
+<h3>Hybrids hypergeometric tests to test if different chromosomes are enriched for DEs</h3>
+```{r}
+exportFigs <- TRUE
+contrasts2sum <- c("Hyb") # "MSHyb.MuSP","MSHyb.DomP","DFHyb.MuSP","DFHyb.DomP")
+dir.create("./enrichment")
+chr.list <- c(seq(1,19),"X","Y")
+results_printing <- c()
+
+focal.cont <- c(paste(contrasts2sum, ".SP",sep = ""), paste(contrasts2sum,".LZ",sep = ""), paste(contrasts2sum,".DIP",sep = ""), paste(contrasts2sum,".RS",sep = ""), paste(contrasts2sum,".WT",sep = ""))
+tt.list <- c(paste(contrasts2sum, ".SP.Dev.tt",sep = ""), paste(contrasts2sum,".LZ.Dev.tt",sep = ""), paste(contrasts2sum,".DIP.Dev.tt",sep = ""), paste(contrasts2sum,".RS.Dev.tt",sep = ""), paste(contrasts2sum,".WT.WT.tt",sep = ""))
+cell.exp.list<- c(paste(contrasts2sum, ".SP.exp", sep = ""), paste(contrasts2sum, ".LZ.exp", sep = ""), paste(contrasts2sum, ".DIP.exp", sep = ""), paste(contrasts2sum, ".RS.exp", sep = ""), paste(contrasts2sum, ".WT.exp", sep = ""))
+
+under.enrich <- data.frame(row.names = chr.list)
+under.enrich.fdr <- data.frame(row.names = chr.list)
+
+over.enrich <- data.frame(row.names = chr.list)
+over.enrich.fdr <- data.frame(row.names = chr.list)
+
+print(gsub("_suspend.*", "", count_file.path))
+print(dim(annotations))
+
+if(exportFigs == TRUE) {
+  pdf(file=paste("exported_figures/hybrid_enrichment", gsub("_suspend.*", "", count_file.path), dim(annotations)[1], ".pdf", sep = "_"), width=14, height=4, pointsize=12)
+}
+
+par(mfrow = c(1,5), mar=c(1.8,1.8,1.8,1.8))
+
+for (f in 1:length(focal.cont)){
+  under <- c()
+  over <- c()
+  exp <- c()
+  obs <- c()
+  
+  
+  
+  for (chr in 1:length(chr.list)){
+    DE_on_chr <- dim(get(tt.list[f])$table[get(tt.list[f])$table$FDR < 0.05 & get(tt.list[f])$table$chr == chr.list[chr],])[1]
+    all_DE_genes <- dim(get(tt.list[f])$table[get(tt.list[f])$table$FDR < 0.05 & get(tt.list[f])$table$chr != "X" & get(tt.list[f])$table$chr != "Y" ,])[1]
+    #all_DE_genes <- dim(get(tt.list[f])$table[get(tt.list[f])$table$FDR < 0.05,])[1]
+    all_expressed_genes <- sum(get(cell.exp.list[f]) %in% rownames(annotations[grep("^[0-9]+", annotations$chr),]))
+    non_DE_genes <- all_expressed_genes - all_DE_genes
+    exp_genes_on_chr <- sum(get(cell.exp.list[f]) %in% rownames(annotations[grep(paste("^",chr.list[chr],"$", sep = ""), annotations$chr),]))
+    
+    under.p <- phyper(DE_on_chr, all_DE_genes, non_DE_genes, exp_genes_on_chr, lower.tail = TRUE)	
+    over.p <- phyper(DE_on_chr, all_DE_genes, non_DE_genes, exp_genes_on_chr, lower.tail = FALSE)
+    under <- c(under, round(under.p, digits = 5))
+    over <- c(over, round(over.p, digits = 5))
+    
+    exp <- c(exp, round((all_DE_genes/all_expressed_genes)*exp_genes_on_chr,digits = 0))
+    obs <- c(obs, DE_on_chr)
+  }			
+  #print((5*(dir-1)+f))
+  print(obs)
+  print(exp)
+  under.enrich.fdr[,f] <- round(p.adjust(under, method = "fdr"), digits = 3)
+  under.enrich[,f] <- under
+  over.enrich.fdr[,f] <- round(p.adjust(over, method = "fdr"), digits = 3)
+  over.enrich[,f] <- over 
+  names(exp) <- paste(chr.list)
+  names(obs) <- paste(chr.list)
+  
+  print(tt.list[f])
+  print("Under:")
+  print(rownames(subset(under.enrich.fdr, under.enrich.fdr[, f] < 0.05)))
+  print("Over:")
+  print(rownames(subset(over.enrich.fdr, over.enrich.fdr[, f] < 0.05)))
+  
+  plot(exp, obs, ylim = c(0, 250), xlim = c(0, 25), col = rgb(red = 99, green = 99, blue = 99, 170, maxColorValue = 255), pch = 16, cex = 1.5,
+       ylab = "Observed", xlab = "Expected", main = paste(tt.list[f], cell.exp.list[f], sep = " "))
+  sig <- c(rownames(subset(under.enrich.fdr, under.enrich.fdr[, f] < 0.05)), rownames(subset(over.enrich.fdr, over.enrich.fdr[, f] < 0.05)))
+  points(y = obs[sig], x = exp[sig], col = "red", pch = 16, cex = 1.5)
+  textxy(exp[sig], obs[sig], labs = over.enrich.fdr[sig, f], offset = 1.8, cex = 0.5)
+  textxy(exp[sig], obs[sig], labs = c(sig), col = "red", cex = 1.025)
+  abline(a = 1, b = 1, col = "gray", lty = 2)
+}
+
+if(exportFigs == TRUE) {
+  dev.off()
+}
+
+exportFigs <- FALSE
+```
+
+<h1>Heatmaps of Whole Genomes</h1>
+
+<h3>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) from all combined data</h3>
+``` {r eval=FALSE}
+#heatmaps
+#everything but whole testes
+#Heatmap(as.matrix(cpm_Full), column_order = Full_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_Full), column_order = Full_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+
+# pdf(file="exported_figures/Heatmap_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+# Heatmap(as.matrix(rpkm_Full.norm), column_order = heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+# dev.off()
+
+
+#restrict to just DE genes
+rpkm_DE_SP_DFHyb.norm <- rpkm_Full_DFHyb.norm[Hyb.SP.Dev.de,]
+rpkm_DE_SP_MSHyb.norm <- rpkm_Full_MSHyb.norm[Hyb.SP.Dev.de,]
+
+rpkm_DE_LZ_DFHyb.norm <- rpkm_Full_DFHyb.norm[Hyb.LZ.Dev.de,]
+rpkm_DE_LZ_MSHyb.norm <- rpkm_Full_MSHyb.norm[Hyb.LZ.Dev.de,]
+
+rpkm_DE_DIP_DFHyb.norm <- rpkm_Full_DFHyb.norm[Hyb.DIP.Dev.de,]
+rpkm_DE_DIP_MSHyb.norm <- rpkm_Full_MSHyb.norm[Hyb.DIP.Dev.de,]
+
+rpkm_DE_RS_DFHyb.norm <- rpkm_Full_DFHyb.norm[Hyb.RS.Dev.de,]
+rpkm_DE_RS_MSHyb.norm <- rpkm_Full_MSHyb.norm[Hyb.RS.Dev.de,]
+
+rpkm_DE_WT_DFHyb.norm <- rpkm_Full_DFHyb.norm[Hyb.WT.WT.de,]
+rpkm_DE_WT_MSHyb.norm <- rpkm_Full_MSHyb.norm[Hyb.WT.WT.de,]
+
+pdf(file="exported_figures/Heatmap_DE_SP_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+Heatmap(as.matrix(cbind(rpkm_DE_SP_DFHyb.norm, rpkm_DE_SP_MSHyb.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+dev.off()
+
+pdf(file="exported_figures/Heatmap_DE_LZ_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+Heatmap(as.matrix(cbind(rpkm_DE_LZ_DFHyb.norm, rpkm_DE_LZ_MSHyb.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+dev.off()
+
+pdf(file="exported_figures/Heatmap_DE_DIP_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+Heatmap(as.matrix(cbind(rpkm_DE_DIP_DFHyb.norm, rpkm_DE_DIP_MSHyb.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+dev.off()
+
+pdf(file="exported_figures/Heatmap_DE_RS_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+Heatmap(as.matrix(cbind(rpkm_DE_RS_DFHyb.norm, rpkm_DE_RS_MSHyb.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+dev.off()
+
+pdf(file="exported_figures/Heatmap_DE_WT_all-stages-all-genotypes.pdf", width=10, height=8, pointsize=24)
+Heatmap(as.matrix(cbind(rpkm_DE_WT_DFHyb.norm, rpkm_DE_WT_MSHyb.norm)), column_order = ALL_Hyb_heatmap_order, column_names_gp = gpar(fontsize=12), show_row_names = FALSE, col = browns, show_row_dend = FALSE, cluster_columns = FALSE, use_raster = FALSE)
+dev.off()
+```
+
+<h3>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) from all development data</h3>
+``` {r eval=FALSE}
+#heatmaps
+#everything but whole testes
+#Heatmap(as.matrix(cpm_Dev), column_order = Dev_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_Dev), column_order = Dev_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_Dev.norm), column_order = Dev_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+```
+
+<h3>Heatmaps of Log(CPM), Log(RPKM), and Log(Normalized(RPKM)) from only whole testes data</h3>
+``` {r eval=FALSE}
+#heatmaps
+#everything but whole testes
+#Heatmap(as.matrix(cpm_WT), column_order = WT_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_WT), column_order = WT_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+#Heatmap(as.matrix(rpkm_WT.norm), column_order = WT_heatmap_order, column_names_gp = gpar(fontsize=4), show_row_names = FALSE, col = reds, show_row_dend = FALSE, cluster_columns = FALSE)
+```
